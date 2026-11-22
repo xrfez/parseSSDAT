@@ -14,6 +14,12 @@
   `writeSegyTo`, `writeSegdTo`, `writeSegyTraces`, `writeSegdTraces`, with options
   for positions, scaling, mean removal, the ground force trace, swapped force
   channels, the SEG-D reference type and the external converter's four traces.
+- The shot block (`vendorLayout`, on by default): every decoded value, the QC record
+  and the three raw records in 2048 bytes, written as one stanza `parseSSDAT:Shot v1`
+  of a SEG-Y file's extended textual header (found by card 37) or as a SEG-D record's
+  external header; vendor maps `parseSSDAT-segy-1` and `parseSSDAT-segd-1` in
+  `vendormaps/`; `shotBlock`, `addShotBlock`, `withShotCard`. Needs parseSEG 0.19.0.
+  `vendorLayout = false` writes exactly the files of before.
 - Benchmark in `bench/`, a libFuzzer target in `tests/fuzz/`.
 - `DatQc` decodes the QC record's fields (crew, vibrator ID, sweep, checksums, force
   and distortion summaries, limit letters, status bytes, the correlation series,

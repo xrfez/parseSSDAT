@@ -62,6 +62,35 @@ vibrator ID.
 `forceMaxPct`, `limits`, `correlation`, `targetForceLbf`, ...) and its raw 240 bytes;
 the doc comment of each says how sure its meaning is.
 
+## The shot block: every value of the shot, inside the file
+
+With `DatWriteOptions.vendorLayout` (on by default) a SEG-Y or SEG-D file carries one
+2048-byte **shot block** per shot: every decoded value (serial, file number, firmware,
+trigger time to the nanosecond, line, station, shot and sweep ids, both positions,
+the options used), the controller's 240-byte QC record verbatim and the file's header,
+position and trailer records verbatim, so the bytes nobody has decoded survive too.
+
+- **SEG-Y:** one binary stanza `parseSSDAT:Shot v1` per shot in the extended textual
+  header (Rev 1 and later; Rev 0 has none and `writeSegy` refuses it with the layout on).
+  Card 37 of the textual header reads `PARSESSDAT SHOT STANZAS VERSION 1 (MAP
+  PARSESSDAT-SEGY-1)`, which is how the map finds the file.
+- **SEG-D:** the record's external header, 64 blocks of 32 bytes, starting with the
+  magic `SSDATSHT`.
+- The traces and the standard header fields are the same with the layout on or off;
+  `vendorLayout = false` writes the plain file only.
+- `shotBlock(shot, opts)` gives the block. For a SEG-Y writer of several shots, call
+  `addShotBlock` for every shot before the first trace and open the writer with
+  `withShotCard(cards)` as its text header; `writeSegdTraces` passes the block itself.
+- The words of `incompleteWhy` are cut at 76 characters in the block (the raw records
+  and `complete` say the rest). The pound-force per count (`lbfPerCount`) is written as
+  you give it and never computed.
+
+The maps that decode the block by field name are in `vendormaps/` (see its README):
+`parseSSDAT-segy-1.nif` and `parseSSDAT-segd-1.nif`. They are for parseSEG's vendor
+maps (`PARSESEG_VENDOR_PATH`, or `loadVendorMaps`), and `decodeVendorAreas` returns the
+block `parseSSDATShot` with its fields (`unitSerial`, `qcVibratorId`, `corr[0]` to
+`corr[127]`, ...). The polarity is as recorded; a block never holds a flipped sign.
+
 ## Many files
 
 - `readDatInfo(path)` reads the first two blocks and the last and nothing else, and
@@ -104,6 +133,7 @@ sample at all, or a zero block with data after it, is refused either way.
 | Source position | the GGA sentence of the header text | `DatWriteOptions.positions` (`dpGga`, `dpFix` for the binary fix, `dpNone`); the shot holds both |
 | SEG-D reference type | 0x96, source reference sweep | `DatWriteOptions.segdReference` (0x98 allowed) |
 | Force channels | file order | `DatWriteOptions.swapForces` |
+| Shot block in the file | written | `DatWriteOptions.vendorLayout` |
 
 SEG-Y positions go in as arc seconds (coordinate units 2). SEG-D has no field for
 geographic coordinates, so SEG-D files get none. SEG-Y has no source line: the line and
@@ -144,5 +174,6 @@ nim docs            # API docs into htmldocs/
 ```
 
 The tests use synthetic files written by `tests/datsynth.nim`: the library reads this
-format and does not write it. `tests/fuzz/fuzzparse.nim` is a libFuzzer target for
+format and does not write it. The shot block is read back through parseSEG with the maps of
+`vendormaps/` in `tests/tvendor.nim`. `tests/fuzz/fuzzparse.nim` is a libFuzzer target for
 `parseDat`.
