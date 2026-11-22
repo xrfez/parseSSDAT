@@ -6,7 +6,9 @@
 ## Seen to fail: with the block's QC record put at byte 255 instead of 257, `fields`
 ## fails; with card 37 left out of the text header, `segy` finds no block; with the
 ## external header passed to no trace, `segd` finds no block; with the two maps
-## differing in one field line, `mapsAgree` fails.
+## differing in one field line, `mapsAgree` fails; with `(byteOrder big)` taken off the
+## maps' multi-byte fields, `littleEndianSegy` (and `mapsAgree`) fail: a little-endian
+## SEG-Y decoded layoutVersion 256.
 
 import std/[math, os, strutils, tables]
 import parseSEG
@@ -224,6 +226,12 @@ proc main*() =
       let m = loadVendorMap(text, name)
       doAssert checkVendorMap(m).len == 0, $checkVendorMap(m)
       doAssert m.name == name.changeFileExt("")
+      doAssert "(version 2)" in text
+      # the block is big-endian whatever the file's order: every multi-byte field says so
+      for line in text.splitLines:
+        for enc in ["u16", "i16", "u32", "f32", "f64"]:
+          if ("(enc " & enc & ")") in line:
+            doAssert "(byteOrder big)" in line, line
       # every field lies inside the 2048-byte block
       var widest = 0
       for line in lines[i]:
@@ -279,6 +287,27 @@ proc main*() =
     let bytes = w.finishBytes()
     let m = openSeismicBytes(bytes, "m.sgy", keys = true)
     doAssert m.blocksOf(reg).len == 1 and m.rawBlocks[0] == shotBlock(s, DatWriteOptions())
+
+  block littleEndianSegy:
+    ## The block is big-endian whatever the file's byte order: a little-endian SEG-Y
+    ## decodes through the map exactly as the big-endian one.
+    let opts = DatWriteOptions(lbfPerCount: 0.125, scale: [1.0, 0.5, 2.0], positions: dpFix)
+    var decoded: array[2, Table[string, VendorValue]]
+    for i, order in [boBig, boLittle]:
+      let p = dir / "o.sgy"
+      s.writeSegy(p, SegyOutputOptions(byteOrder: order), opts)
+      var f = openSeismic(p, keys = true)
+      doAssert not f.log.isFatal, $f.log
+      let blocks = f.blocksOf(reg)
+      doAssert blocks.len == 1, $blocks.len
+      decoded[i] = byName(blocks[0])
+      checkFields(decoded[i], s, opts, dpFix)
+      checkRaw(f.rawBlocks[0], s)
+      doAssert f.rawBlocks[0] == shotBlock(s, opts)
+      f.close()
+    doAssert decoded[0].len == decoded[1].len and decoded[0].len > 90
+    for name, v in decoded[0]:
+      doAssert name in decoded[1] and $decoded[1][name] == $v, name
 
   block fields:
     ## Every field, with the default options and with positions of the GGA sentence.

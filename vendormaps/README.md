@@ -15,7 +15,7 @@ controller's `.dat` signature file: the shot block (decoded fields, QC record, r
 records). The layout belongs to parseSSDAT, not to the controller's maker; the maps
 carry no company name and the files hold no value that is not in the `.dat` file.
 
-The block is 2048 bytes, big-endian: 8 bytes `SSDATSHT`, the layout version and the
+The block is 2048 bytes, big-endian whatever the byte order of the file (every multi-byte field of both maps says `(byteOrder big)`; map version 2. Version 1 of the maps, in parseSSDAT 0.1.0, left the order to the file and decoded a little-endian SEG-Y wrongly; the bytes written were always the same, so a file of 0.1.0 decodes right with version 2): 8 bytes `SSDATSHT`, the layout version and the
 block length, the decoded header, position and trailer values, the 240-byte QC record
 verbatim from byte 257 (its fields and the 128-value correlation series decoded by name,
 `qc...` and `corr[i]`), and the three raw 512-byte records of the file. Unused bytes are
