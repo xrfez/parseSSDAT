@@ -81,9 +81,18 @@ position and trailer records verbatim, so the bytes nobody has decoded survive t
 - `shotBlock(shot, opts)` gives the block. For a SEG-Y writer of several shots, call
   `addShotBlock` for every shot before the first trace and open the writer with
   `withShotCard(cards)` as its text header; `writeSegdTraces` passes the block itself.
-- The words of `incompleteWhy` are cut at 76 characters in the block (the raw records
-  and `complete` say the rest). The pound-force per count (`lbfPerCount`) is written as
-  you give it and never computed.
+- The words of `incompleteWhy` are cut at the last space within 76 characters in the
+  block (the raw records and `complete` say the rest). The pound-force per count
+  (`lbfPerCount`, 0 or more; 0 means not given) is written as you give it and never
+  computed. The `positions` byte and the text header say what was written: none for a
+  GGA position asked of a shot without a valid sentence, or a fix asked of one without a
+  fix. A shot whose numbers do not fit the block (a 32-bit field out of range, a QC
+  record that is not 240 bytes, a raw record that is not 512) is refused with
+  `DatWriteError` while `vendorLayout` is on.
+- `gnssText` is the file's own 212 bytes, NUL padding included: a reader stops at the
+  first NUL (the map's `(trim right)` strips blanks only).
+- On Windows, if another program holds the claimed file open while `writeSegyTo` or
+  `writeSegdTo` finishes, the write fails with an `IOError` and an empty file may remain.
 
 The maps that decode the block by field name are in `vendormaps/` (see its README):
 `parseSSDAT-segy-1.nif` and `parseSSDAT-segd-1.nif`. They are for parseSEG's vendor
