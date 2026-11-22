@@ -15,3 +15,10 @@
   for positions, scaling, mean removal, the ground force trace, swapped force
   channels, the SEG-D reference type and the external converter's four traces.
 - Benchmark in `bench/`, a libFuzzer target in `tests/fuzz/`.
+- `DatQc` decodes the QC record's fields (crew, vibrator ID, sweep, checksums, force
+  and distortion summaries, limit letters, status bytes, the correlation series,
+  position quality, stiffness, viscosity, target force); fields matched only in part
+  are marked probable in their docs.
+- The samples and the ground force are written as recorded: the file's ground force is
+  opposite in sign to its reference, and no option changes a sign.
+- `writeSegyTo` and `writeSegdTo` claim their file name exclusively.

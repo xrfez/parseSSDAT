@@ -15,6 +15,12 @@ channels of signed 24-bit counts, one sample per millisecond:
 | 3 `dcBaseplate` | the baseplate force | 19 | 0x95 |
 | 4 (written) | the controller's ground force, estimated: the sum of 2 and 3 | 20 | 0x93 |
 
+**Polarity.** The ground force as the controller records it sits 180 degrees from its
+reference (opposite in sign) in every sweep where that can be told; the controller
+itself reads that as 0 degrees of phase. This library writes the samples and the ground
+force exactly as recorded and never changes a sign. There is no option that flips or
+aligns polarity.
+
 Channels 2 and 3 are the controller's mass-weighted accelerations, in raw counts. The
 external converter that some sites use labels them the other way round (its SEG-Y
 calls channel 2 the baseplate); `DatWriteOptions.swapForces` is there for a unit that
@@ -45,11 +51,16 @@ shot.writeSegd("shot.sgd")                 # SEG-D Rev 3: 0x96, 0x99, 0x95, 0x93
 let path = shot.writeSegyTo("out")         # out/<datFileStem>.sgy, never overwritten
 ```
 
-The controller's **serial number** (`controllerSerial`, bytes 32-33 of the header, the
-number the controller's folders are named after) and the operator's **vibrator ID**
+The controller's **serial number** (`controllerSerial`, the 32-bit number in every
+record header, the number the controller's folders are named after; header bytes 32
+and 33 repeat it as remainder and quotient by 100, which agreed in every file seen) and the operator's **vibrator ID**
 (`qc.vibratorId`, from the QC record, absent from a stopped recording) are different
 numbers. File names use the serial; the SEG-Y device trace identifier holds the
 vibrator ID.
+
+`shot.qc` holds the QC record's decoded fields (`crew`, `vibratorId`, `sweepId`,
+`forceMaxPct`, `limits`, `correlation`, `targetForceLbf`, ...) and its raw 240 bytes;
+the doc comment of each says how sure its meaning is.
 
 ## Many files
 
@@ -64,8 +75,12 @@ vibrator ID.
   with its own shot and buffer.
 - `looksLikeDat(first512Bytes)` tells a `.dat` file from another by its first block.
 - `datFileStem(shot)` is the name every default output uses: the serial in four digits
-  and the exact trigger time, UTC, to the nanosecond, `0042_20010203T040506.789000000Z`.
-  It sorts, and holds nothing Windows forbids.
+  and the exact trigger time, UTC, to the nanosecond, `0042_20010203T040506.789000000Z`
+  (a serial above 9999 gives a wider stem). It sorts for serials of one width, and holds
+  nothing Windows forbids.
+- `writeSegyTo` and `writeSegdTo` claim the file name exclusively: of several writers
+  after the same name exactly one succeeds (an empty file stands there while it
+  writes), the others get `DatWriteError`.
 
 `nim bench` (or `nim c -d:release -r bench/bench.nim <folder>`) prints files per second
 and MB/s for both.
