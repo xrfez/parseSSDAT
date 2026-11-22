@@ -196,6 +196,47 @@ func recordBytes(s: DatShot; kind: uint8): seq[byte] =
   for r in s.records:
     if r.kind == kind: result = r.bytes
 
+proc fail(s: DatInfo; what: string) {.noinline, noreturn.} =
+  raise newException(DatWriteError, "file number " & $s.fileNumber & ": " & what)
+
+proc checkBlockFields(s: DatShot) =
+  ## The shot block holds 32-bit fields and a 240-byte QC record and three 512-byte
+  ## records: refuse a shot that does not fit them, in words, rather than wrap or
+  ## overwrite.
+  for (name, v) in [("controller serial", s.controllerSerial),
+      ("file number", s.fileNumber), ("declared samples", int64(s.declaredSamples)),
+      ("samples", int64(s.len)), ("source line", s.sourceLine),
+      ("source station", s.sourceStation), ("shot id", s.shotId),
+      ("source index", s.sourceIndex), ("trailer counter", s.trailerCounter),
+      ("sweep id", s.sweepId)]:
+    if v < 0 or v > 4_294_967_295'i64:
+      fail(s, "the " & name & " " & $v & " does not fit the 32 bits of the shot block " &
+        "(set vendorLayout to false to write the file without it)")
+  let t = s.trigger
+  if t.year notin 0 .. 65535 or t.month notin 0 .. 255 or t.day notin 0 .. 255 or
+      t.hour notin 0 .. 255 or t.minute notin 0 .. 255 or t.second notin 0 .. 255 or
+      t.nanosecond notin 0 .. 999_999_999:
+    fail(s, "the trigger time " & $t.year & "-" & $t.month & "-" & $t.day & " " & $t.hour &
+      ":" & $t.minute & ":" & $t.second & "." & $t.nanosecond &
+      " does not fit the shot block")
+  if s.firmware.major notin 0 .. 255 or s.firmware.minor notin 0 .. 255:
+    fail(s, "the firmware version does not fit the shot block")
+  if s.qc.raw.len notin [0, QcRecordBytes]:
+    fail(s, "the QC record has " & $s.qc.raw.len & " bytes, not " & $QcRecordBytes)
+  if s.gga.valid:
+    if s.gga.fixQuality notin 0 .. 255 or s.gga.satellites notin 0 .. 255:
+      fail(s, "the GGA fix quality or satellite count does not fit the shot block")
+  if s.fix.heightDm notin -32768 .. 32767:
+    fail(s, "the fix height " & $s.fix.heightDm & " does not fit the 16 bits of the shot block")
+  if s.fix.fixQuality notin 0 .. 255 or s.fix.satellites notin 0 .. 255:
+    fail(s, "the fix quality or satellite count does not fit the shot block")
+  if not (s.fix.hdop >= 0 and s.fix.hdop * 10 < 255.5):
+    fail(s, "the fix HDOP " & $s.fix.hdop & " does not fit the shot block (0 to 25.5)")
+  for r in s.records:
+    if r.bytes.len != RawRecordBytes:
+      fail(s, "a raw record of the file has " & $r.bytes.len & " bytes, not " &
+        $RawRecordBytes)
+
 proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
   ## The 2048-byte shot block: every decoded value of `s`, the controller's 240-byte QC
   ## record and the file's header, position and trailer records, verbatim (so the bytes
@@ -206,7 +247,10 @@ proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
   ## not got (a stopped recording has no trailer) is zeros. `opts` supplies what the
   ## shot does not hold: the scale factors, mean removal, ground force trace, the
   ## positions that are written (`writtenPositions`) and `lbfPerCount`. The samples are not in it, and no sign is
-  ## changed anywhere.
+  ## changed anywhere. Raises `DatWriteError`, in words, when a value does not fit its
+  ## place in the block (a number above 32 bits or below 0, a date field above 255, a
+  ## record of the wrong length): nothing is wrapped or cut.
+  checkBlockFields(s)
   result = newSeq[byte](ShotBlockBytes)
   for i, c in ShotMagic:
     result[i] = byte(c)
@@ -269,9 +313,6 @@ proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
     for i, v in recordBytes(s, kind):
       result[at + i] = v
 
-proc fail(s: DatInfo; what: string) {.noinline, noreturn.} =
-  raise newException(DatWriteError, "file number " & $s.fileNumber & ": " & what)
-
 func meanOf(v: openArray[int32]): float64 =
   var sum = 0'i64
   for x in v:
@@ -286,35 +327,6 @@ func source(c: DatChannel; swap: bool): DatChannel =
 
 func positive(v: float64): bool =
   v > 0 and v < Inf
-
-proc checkBlockFields(s: DatShot) =
-  ## The shot block holds 32-bit fields and a 240-byte QC record and three 512-byte
-  ## records: refuse a shot that does not fit them, in words, rather than wrap or
-  ## overwrite.
-  for (name, v) in [("controller serial", s.controllerSerial),
-      ("file number", s.fileNumber), ("declared samples", int64(s.declaredSamples)),
-      ("samples", int64(s.len)), ("source line", s.sourceLine),
-      ("source station", s.sourceStation), ("shot id", s.shotId),
-      ("source index", s.sourceIndex), ("trailer counter", s.trailerCounter),
-      ("sweep id", s.sweepId)]:
-    if v < 0 or v > 4_294_967_295'i64:
-      fail(s, "the " & name & " " & $v & " does not fit the 32 bits of the shot block " &
-        "(set vendorLayout to false to write the file without it)")
-  let t = s.trigger
-  if t.year notin 0 .. 65535 or t.month notin 0 .. 255 or t.day notin 0 .. 255 or
-      t.hour notin 0 .. 255 or t.minute notin 0 .. 255 or t.second notin 0 .. 255 or
-      t.nanosecond notin 0 .. 999_999_999:
-    fail(s, "the trigger time " & $t.year & "-" & $t.month & "-" & $t.day & " " & $t.hour &
-      ":" & $t.minute & ":" & $t.second & "." & $t.nanosecond &
-      " does not fit the shot block")
-  if s.firmware.major notin 0 .. 255 or s.firmware.minor notin 0 .. 255:
-    fail(s, "the firmware version does not fit the shot block")
-  if s.qc.raw.len notin [0, QcRecordBytes]:
-    fail(s, "the QC record has " & $s.qc.raw.len & " bytes, not " & $QcRecordBytes)
-  for r in s.records:
-    if r.bytes.len != RawRecordBytes:
-      fail(s, "a raw record of the file has " & $r.bytes.len & " bytes, not " &
-        $RawRecordBytes)
 
 proc checkOptions(s: DatShot; opts: DatWriteOptions; segd: bool) =
   ## Everything that makes a shot or the options unwritable and that parseSEG would

@@ -539,6 +539,37 @@ proc main*() =
     doAssert cast[string](shotBlock(sh, DatWriteOptions())[180 ..< 256]).strip(
       leading = false) == "short words"
 
+  block shotBlockLimits:
+    ## `shotBlock` called on its own refuses what does not fit, in words, instead of
+    ## writing a wrapped or cut number.
+    proc refusedBlock(name: string; tweak: proc (x: var DatShot)) =
+      var sh = s
+      tweak(sh)
+      try:
+        discard shotBlock(sh, DatWriteOptions())
+        doAssert false, name & ": a block was written"
+      except DatWriteError as e:
+        doAssert "does not fit" in e.msg or "bytes" in e.msg, e.msg
+    refusedBlock("negative", proc (x: var DatShot) = x.fileNumber = -1)
+    refusedBlock("40 bits", proc (x: var DatShot) = x.fileNumber = 1'i64 shl 40)
+    refusedBlock("serial", proc (x: var DatShot) = x.controllerSerial = -3)
+    refusedBlock("year", proc (x: var DatShot) = x.trigger.year = 70000)
+    refusedBlock("month", proc (x: var DatShot) = x.trigger.month = -1)
+    refusedBlock("height", proc (x: var DatShot) = x.fix.heightDm = 40000)
+    refusedBlock("fix satellites", proc (x: var DatShot) = x.fix.satellites = 300)
+    refusedBlock("fix hdop", proc (x: var DatShot) = x.fix.hdop = 30.0)
+    refusedBlock("qc length", proc (x: var DatShot) = x.qc.raw.add 0'u8)
+    refusedBlock("record length", proc (x: var DatShot) = x.records[0].bytes.add 0'u8)
+    # the words name the value
+    var sh = s
+    sh.fileNumber = 1'i64 shl 40
+    try:
+      discard shotBlock(sh, DatWriteOptions())
+    except DatWriteError as e:
+      doAssert "file number" in e.msg and "32 bits" in e.msg, e.msg
+    # a shot that fits is written as before
+    doAssert shotBlock(s, DatWriteOptions()).len == ShotBlockBytes
+
   block refusals:
     ## Rev 0 has no stanzas: refused in words, or written plain.
     doAssertRaises(DatWriteError):
