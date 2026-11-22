@@ -1,0 +1,17 @@
+# Changelog
+
+## 0.1.0 - Unreleased
+
+- Decoder for a vibrator controller's `.dat` signature files: `parseDat`, `readDat`,
+  `decodeInto` and `readDatInto` (a shot and a buffer kept between files),
+  `parseDatInfo` and `readDatInfo` (a file's header, position, trailer and QC record
+  from three blocks, for file lists), `looksLikeDat`, `datFileStem`.
+- Channels: reference, reaction-mass force, baseplate force (raw counts); the
+  controller's ground force as their sum (`groundForce`); the QC record as `DatQc`.
+- Refuses every damaged file with `DatFormatError` or `DatIncompleteError`; a stopped
+  recording can be read with `allowIncomplete`.
+- Writers for SEG-Y and SEG-D through parseSEG: `writeSegy`, `writeSegd`,
+  `writeSegyTo`, `writeSegdTo`, `writeSegyTraces`, `writeSegdTraces`, with options
+  for positions, scaling, mean removal, the ground force trace, swapped force
+  channels, the SEG-D reference type and the external converter's four traces.
+- Benchmark in `bench/`, a libFuzzer target in `tests/fuzz/`.
