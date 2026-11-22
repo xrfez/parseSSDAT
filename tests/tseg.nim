@@ -9,7 +9,7 @@
 ## given the SEG-Y positions, `segd` fails; with the ground force summing the same
 ## channel twice, `codes` fails; with the serial in the device id, `segyHeaders` fails.
 
-import std/[math, os, options, strutils]
+import std/[atomics, math, os, options, strutils]
 import parseSEG
 import parseSSDAT
 import datsynth
@@ -261,8 +261,8 @@ proc main*() =
 
   block externalConverter:
     ## The external converter's four traces from typed numbers (made up here).
-    let cv = DatConverterUnit(reactionMassWeight: 11000.0, baseplateWeight: 5000.0,
-      holdDownWeight: 26000.0, k: 0.75, s0: 0.0125)
+    let cv = DatConverterUnit(reactionMassWeight: 1111.0, baseplateWeight: 2222.0,
+      holdDownWeight: 12345.0, k: 0.375, s0: 0.0625)
     let o = DatWriteOptions(externalConverter: some(cv), groundForce: false)
     s.writeSegy(dir / "cv.sgy", dat = o)
     var f = openSeismic(dir / "cv.sgy", keys = true)
@@ -285,7 +285,7 @@ proc main*() =
     let text = f.textHeader
     doAssert "equal-weight sum of accelerations, not a mass-weighted sum" in
       textCards(s, o).join("\n").replace("\n  ", " ")
-    doAssert "hold-down weight 26000.0 lb" in text
+    doAssert "hold-down weight 12345.0 lb" in text
     f.close()
     # all five numbers are needed
     for bad in [DatConverterUnit(), DatConverterUnit(reactionMassWeight: 1, baseplateWeight: 1,
@@ -435,6 +435,122 @@ proc main*() =
     f = openSeismic(dir / "n.sgd")
     doAssert f.len == 4
     f.close()
+
+  block polarityAsRecorded:
+    ## The samples and the ground force go in as recorded: no sign is changed, and
+    ## the text header says how the file's ground force sits against its reference.
+    var neg = s
+    for i in 0 ..< neg.len:
+      neg.data[dcMass][i] = -abs(neg.data[dcMass][i]) - 1
+      neg.data[dcBaseplate][i] = -abs(neg.data[dcBaseplate][i]) - 2
+      neg.data[dcReference][i] = abs(neg.data[dcReference][i]) + 3
+    neg.writeSegy(dir / "pol.sgy")
+    var f = openSeismic(dir / "pol.sgy")
+    let back = readBack(f, 4)
+    for i in 0 ..< neg.len:
+      doAssert back[0][i] == float32(neg.data[dcReference][i]) and back[0][i] > 0
+      doAssert back[1][i] == float32(neg.data[dcMass][i]) and back[1][i] < 0
+      doAssert back[3][i] == float32(neg.data[dcMass][i] + neg.data[dcBaseplate][i])
+    doAssert "opposite in sign to the reference" in f.textHeader.replace("\n", " ")
+    f.close()
+
+  block exclusiveClaim:
+    ## A name is claimed in one step: a file already there, or another writer ahead,
+    ## means `DatWriteError`; the empty claim of a failed write is removed.
+    let folder = dir / "claim"
+    createDir(folder)
+    let stem = datFileStem(s)
+    writeFile(folder / (stem & ".sgy"), "")
+    doAssertRaises(DatWriteError):
+      discard s.writeSegyTo(folder)
+    doAssert readFile(folder / (stem & ".sgy")) == "" # not touched
+    removeFile(folder / (stem & ".sgy"))
+    # a write that fails after the claim leaves nothing
+    var wide = s
+    wide.sourceLine = 4_294_967_295'i64
+    wide.sourceStation = 4_294_967_295'i64
+    doAssertRaises(DatWriteError):
+      discard wide.writeSegdTo(folder)
+    doAssert not fileExists(folder / (stem & ".sgd"))
+    # a folder that cannot be made is an IOError (its parent is a file)
+    writeFile(dir / "plain", "x")
+    doAssertRaises(IOError):
+      discard s.writeSegyTo(dir / "plain" / "sub")
+    doAssertRaises(IOError):
+      discard s.writeSegdTo(dir / "plain" / "sub")
+
+  when defined(posix):
+    block folderNotWritable:
+      ## The file system's refusal (permission denied: an `OSError` from `createDir` or
+      ## the claim) comes out as `IOError`, as the module promises. Not when run as root.
+      let ro = dir / "readonly"
+      createDir(ro)
+      setFilePermissions(ro, {fpUserRead, fpUserExec})
+      try:
+        if not (try: (writeFile(ro / "probe", "x"); false) except IOError: true):
+          removeFile(ro / "probe") # the permission does not bind this user
+        else:
+          doAssertRaises(IOError):
+            discard s.writeSegyTo(ro / "sub")
+          doAssertRaises(IOError):
+            discard s.writeSegdTo(ro)
+          doAssertRaises(IOError):
+            discard s.writeSegyTo(ro)
+      finally:
+        setFilePermissions(ro, {fpUserRead, fpUserWrite, fpUserExec})
+
+  block racingWriters:
+    ## Writers after one name at the same time: exactly one gets it.
+    type Race = object
+      shot: ptr DatShot
+      folder: cstring
+      won, lost, other: Atomic[int]
+    let raceDir = dir / "race"
+    var race = Race(folder: cstring(raceDir))
+    var shot = s
+    race.shot = addr shot
+    proc worker(r: ptr Race) {.thread.} =
+      {.cast(gcsafe).}:
+        try:
+          discard r.shot[].writeSegyTo($r.folder)
+          discard r.won.fetchAdd(1)
+        except DatWriteError:
+          discard r.lost.fetchAdd(1)
+        except CatchableError:
+          discard r.other.fetchAdd(1)
+    for round in 0 ..< 5:
+      removeDir(dir / "race")
+      race.won.store(0)
+      race.lost.store(0)
+      race.other.store(0)
+      var threads: array[8, Thread[ptr Race]]
+      for i in 0 ..< threads.len:
+        createThread(threads[i], worker, addr race)
+      joinThreads(threads)
+      doAssert race.won.load == 1 and race.lost.load == 7 and race.other.load == 0,
+        $(race.won.load, race.lost.load, race.other.load)
+      doAssert openSeismic(dir / "race" / (datFileStem(s) & ".sgy")).len == 4
+
+  block writerRevisions:
+    ## `writeSegyTraces` with its default suits a Rev 1 writer; the exact nanoseconds
+    ## are for a Rev 2 writer, which `extHeader = true` asks for.
+    var w = openSeismicWriter(dir / "rev1.sgy", SegyOutputOptions(revision: SegyRevision(
+      major: 1, minor: 0)))
+    w.writeSegyTraces(s)
+    doAssert w.close().len == 0
+    var f = openSeismic(dir / "rev1.sgy")
+    doAssert f.len == 4
+    f.close()
+    var w2 = openSeismicWriter(dir / "rev2.sgy", SegyOutputOptions())
+    w2.writeSegyTraces(s, extHeader = true)
+    doAssert w2.close().len == 0
+    f = openSeismic(dir / "rev2.sgy", keys = true)
+    doAssert f.headerValue(0, "ext1", "nanoseconds") == "789000000"
+    f.close()
+    var w3 = openSeismicWriter(dir / "rev1b.sgy", SegyOutputOptions(revision: SegyRevision(
+      major: 1, minor: 0)))
+    doAssertRaises(DatWriteError): # asking for the extension a Rev 1 file has not got
+      w3.writeSegyTraces(s, extHeader = true)
 
   block unwritable:
     doAssertRaises(CatchableError):

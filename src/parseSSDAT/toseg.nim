@@ -22,6 +22,10 @@
 ## the writer reports when it closes, are `IOError`.
 
 import std/[math, options, os, strutils]
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 import parseSEG
 import ./[decode, types]
 
@@ -153,6 +157,10 @@ proc checkOptions(s: DatShot; opts: DatWriteOptions; segd: bool) =
   ## say in its own words, said in ours.
   if s.len == 0:
     fail(s, "the shot holds no samples")
+  for c in DatChannel:
+    if s.data[c].len != s.len:
+      fail(s, "the " & $c & " channel has " & $s.data[c].len & " samples, the " &
+        "reference " & $s.len)
   if opts.externalConverter.isSome:
     let c = opts.externalConverter.get
     for (name, v) in [("reaction-mass weight", c.reactionMassWeight),
@@ -242,12 +250,14 @@ template translating(s: DatInfo; what: string; body: untyped) =
     fail(s, "cannot be written as " & what & ": " & e.msg)
 
 proc writeSegyTraces*(w: var SeismicWriter; s: DatShot; opts = DatWriteOptions();
-    extHeader = true) =
+    extHeader = false) =
   ## Appends the traces of `s` to the open SEG-Y writer `w`: one record, numbered by
-  ## the file number. `extHeader` says the file is Rev 2 or later, where the trigger
-  ## time's nanoseconds go exactly into Trace Header Extension 1; in Rev 1 and Rev 0
-  ## the time is kept to the second the format has room for (the fraction goes with it
-  ## where the writer keeps one). The controller's vibrator ID goes into the trace
+  ## the file number. `extHeader` must be set only for a Rev 2 or later writer (the
+  ## default, false, suits every revision): the trigger time's nanoseconds then go
+  ## exactly into Trace Header Extension 1, which a Rev 1 or Rev 0 writer has not
+  ## got (it would refuse them). Without it the time goes in as seconds with a
+  ## fraction, as far as the format and the writer keep one. `writeSegy` sets it from
+  ## its options. The controller's vibrator ID goes into the trace
   ## header's device trace identifier when the file has a QC record and the ID fits
   ## 16 bits. Raises `DatWriteError` (see the module's text).
   checkOptions(s, opts, false)
@@ -317,6 +327,8 @@ func textCards*(s: DatInfo; opts: DatWriteOptions; positions = dpGga): seq[strin
       cards.wrapped "raw counts"
     if opts.groundForce:
       cards.wrapped "trace 4 controller ground force (estimated): sum of traces 2 and 3"
+      cards.wrapped "as recorded: opposite in sign to the reference, which the " &
+        "controller reads as 0 degrees"
   if opts.swapForces:
     cards.wrapped "traces 2 and 3 swapped against the file's channel order"
   case positions
@@ -369,25 +381,69 @@ proc writeSegd*(s: DatShot; path: string; dat = DatWriteOptions()) =
   translating(s, "SEG-D"):
     w.finish()
 
-proc outputPath(s: DatInfo; folder, ext: string; overwrite: bool): string =
+proc createExclusively(path: string): bool =
+  ## Creates an empty file at `path` unless a file is there, in one step the file
+  ## system makes atomic (`O_EXCL`, `CREATE_NEW`): false when `path` exists. Raises
+  ## `OSError` for any other failure.
+  when defined(windows):
+    const alreadyExists = [80'i32, 183] # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+    let h = createFileW(newWideCString(path), GENERIC_WRITE, 0, nil, CREATE_NEW,
+      FILE_ATTRIBUTE_NORMAL, 0)
+    result = h != INVALID_HANDLE_VALUE
+    if result:
+      discard closeHandle(h)
+    elif getLastError() notin alreadyExists:
+      raiseOSError(osLastError())
+  else:
+    let fd = posix.open(path.cstring, O_CREAT or O_EXCL or O_WRONLY, Mode(0o644))
+    result = fd >= 0
+    if result:
+      discard posix.close(fd)
+    elif errno != EEXIST:
+      raiseOSError(osLastError())
+
+proc claimedPath(s: DatInfo; folder, ext: string; overwrite: bool): string =
+  ## The output path `folder / datFileStem(s) & ext`, with the folder made. Unless
+  ## `overwrite`, the path is claimed by creating an empty file there, exclusively: of
+  ## several writers after one name exactly one gets it, the others `DatWriteError`.
+  ## (The winner's finished file replaces the empty one.)
   result = folder / (datFileStem(s) & ext)
-  if not overwrite and fileExists(result):
-    fail(s, "the output file " & result & " exists and is not overwritten")
+  try:
+    createDir(folder)
+    if not overwrite and not createExclusively(result):
+      fail(s, "the output file " & result & " exists and is not overwritten")
+  except OSError as e:
+    raise newException(IOError, "cannot create " & result & ": " & e.msg)
+
+template writeClaimed(s: DatInfo; path: string; overwrite: bool; body: untyped) =
+  ## Runs `body`, which writes `path`; a failure removes the empty file claimed for it.
+  try:
+    body
+  except CatchableError:
+    if not overwrite:
+      try:
+        removeFile(path)
+      except OSError:
+        discard # the first failure is the one to report
+    raise
 
 proc writeSegyTo*(s: DatShot; folder: string; opts = SegyOutputOptions();
     dat = DatWriteOptions(); overwrite = false): string =
   ## `writeSegy` into `folder` (made when missing) under the name `datFileStem(s)` and
   ## `.sgy`; returns the path. An existing file raises `DatWriteError` unless
-  ## `overwrite`.
-  result = outputPath(s, folder, ".sgy", overwrite)
-  createDir(folder)
-  s.writeSegy(result, opts, dat)
+  ## `overwrite`: the name is claimed exclusively (see `claimedPath`), so two writers
+  ## after the same name cannot both succeed. While the file is being written an empty
+  ## file stands at the name. A folder that cannot be made is an `IOError`.
+  checkOptions(s, dat, false)
+  result = claimedPath(s, folder, ".sgy", overwrite)
+  writeClaimed(s, result, overwrite):
+    s.writeSegy(result, opts, dat)
 
 proc writeSegdTo*(s: DatShot; folder: string; dat = DatWriteOptions();
     overwrite = false): string =
   ## `writeSegd` into `folder` (made when missing) under the name `datFileStem(s)` and
-  ## `.sgd`; returns the path. An existing file raises `DatWriteError` unless
-  ## `overwrite`.
-  result = outputPath(s, folder, ".sgd", overwrite)
-  createDir(folder)
-  s.writeSegd(result, dat)
+  ## `.sgd`; returns the path. As `writeSegyTo`.
+  checkOptions(s, dat, true)
+  result = claimedPath(s, folder, ".sgd", overwrite)
+  writeClaimed(s, result, overwrite):
+    s.writeSegd(result, dat)
