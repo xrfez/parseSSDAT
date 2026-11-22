@@ -12,6 +12,11 @@
 ## the plain sum of traces 2 and 3 (20, 0x93). The external converter that some sites
 ## use labels the two force channels the other way round.
 ##
+## **The shot block.** With `vendorLayout` (the default) every decoded value of the shot
+## goes into the file too, as a 2048-byte block (`shotBlock`): in SEG-Y the stanza
+## `parseSSDAT:Shot v1`, in SEG-D the record's external header. The vendor maps in
+## `vendormaps/` decode it by name through parseSEG. Nothing in it changes a sign.
+##
 ## **Errors.** A value the format cannot hold or an option that makes no sense raises
 ## `DatWriteError` with plain words that name the value: a source index above 255, a
 ## file number above 16777215, or a line without a station, in SEG-D; a weight that is
@@ -33,8 +38,17 @@ const
   PackageVersion = "0.1.0"
   CodeGroundForce = 20'i16 ## SEG-Y trace code of the controller's ground force
   CardWidth = 76           ## parseSEG puts "C nn " before each textual header card of 80
+  RecognitionCard = 37     ## the textual header card that names the shot stanzas
+  ShotLayoutVersion = 1
   MaxSegdSourceIndex = 255
   MaxSegdFileNumber = 16_777_215
+
+const
+  ShotCardText* = "PARSESSDAT SHOT STANZAS VERSION 1 (MAP PARSESSDAT-SEGY-1)"
+    ## Card 37 of a SEG-Y file written with `vendorLayout`: what the vendor map
+    ## `parseSSDAT-segy-1` recognises the file by.
+  ShotBlockBytes* = 2048 ## the size of the shot block
+  ShotMagic* = "SSDATSHT" ## its first eight bytes, which the SEG-D map recognises it by
 
 type
   DatPositions* = enum
@@ -67,6 +81,15 @@ type
     segdReference*: SegdChannelType = sctSourceRefSweep
       ## The SEG-D channel type of the reference: `sctSourceRefSweep` (0x96) or
       ## `sctSourceRefPilot` (0x98).
+    vendorLayout*: bool = true
+      ## Write the whole shot into the file as a shot block (`shotBlock`): in SEG-Y one
+      ## binary stanza `parseSSDAT:Shot v1` in the extended textual header, found by
+      ## card 37 of the textual header; in SEG-D the record's external header. False
+      ## writes a plain file with only the standard fields and traces (the same traces).
+      ## SEG-Y Rev 0 has no stanzas: `writeSegy` refuses it with `vendorLayout`.
+    lbfPerCount*: float64 = 0.0
+      ## Pounds-force per count, written into the shot block as given, never computed
+      ## (about 1/8, but not exactly known). 0 means none given.
     externalConverter*: Option[DatConverterUnit]
       ## When set, the writers produce the four traces of the external converter
       ## instead (this replaces `scale`, `removeMean` and `groundForce`): trace 1 is
@@ -133,6 +156,97 @@ func toTraceKeys*(s: DatInfo; c: DatChannel; positions = dpNone): TraceKeys =
   result.rcvX = result.srcX
   result.rcvY = result.srcY
   result.rcvZ = result.srcZ
+
+proc putBe(b: var seq[byte]; at, width: int; v: uint64) =
+  for i in 0 ..< width:
+    b[at + i] = byte((v shr (8 * (width - 1 - i))) and 0xFF)
+
+proc putFloat(b: var seq[byte]; at: int; v: float64) =
+  putBe(b, at, 8, cast[uint64](v))
+
+proc putFloat32(b: var seq[byte]; at: int; v: float32) =
+  putBe(b, at, 4, uint64(cast[uint32](v)))
+
+func clampTo(v: int; hi: int): uint64 =
+  uint64(max(0, min(v, hi)))
+
+func recordBytes(s: DatShot; kind: uint8): seq[byte] =
+  ## The raw block of the header, position or trailer record; empty when `s` has none.
+  result = @[]
+  for r in s.records:
+    if r.kind == kind: result = r.bytes
+
+proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
+  ## The 2048-byte shot block: every decoded value of `s`, the controller's 240-byte QC
+  ## record and the file's header, position and trailer records, verbatim (so the bytes
+  ## nobody has decoded survive). Big-endian, laid out as the vendor maps in
+  ## `vendormaps/` say (byte 1 `SSDATSHT`, layout version 1, block length 2048). Unused
+  ## bytes are 0 (the 76 of `incompleteWhy` are blanks, and the words are cut at 76
+  ## characters: the block has no more room for them); a latitude or longitude that is NaN means none; a record the shot has
+  ## not got (a stopped recording has no trailer) is zeros. `opts` supplies what the
+  ## shot does not hold: the scale factors, mean removal, ground force trace, the
+  ## positions asked for and `lbfPerCount`. The samples are not in it, and no sign is
+  ## changed anywhere.
+  result = newSeq[byte](ShotBlockBytes)
+  for i, c in ShotMagic:
+    result[i] = byte(c)
+  putBe(result, 8, 2, ShotLayoutVersion)
+  putBe(result, 10, 2, ShotBlockBytes)
+  putBe(result, 12, 4, uint64(s.controllerSerial))
+  putBe(result, 16, 4, uint64(s.fileNumber))
+  result[20] = byte(clampTo(s.firmware.major, 255))
+  result[21] = byte(clampTo(s.firmware.minor, 255))
+  result[22] = byte(ord(s.complete))
+  result[23] = byte(ord(high(DatChannel)) + 1)
+  putBe(result, 24, 4, uint64(s.len))
+  putBe(result, 28, 4, uint64(s.declaredSamples))
+  putFloat(result, 32, s.sampleIntervalUs)
+  putBe(result, 40, 2, clampTo(s.trigger.year, 65535))
+  result[42] = byte(clampTo(s.trigger.month, 255))
+  result[43] = byte(clampTo(s.trigger.day, 255))
+  result[44] = byte(clampTo(s.trigger.hour, 255))
+  result[45] = byte(clampTo(s.trigger.minute, 255))
+  result[46] = byte(clampTo(s.trigger.second, 255))
+  putBe(result, 48, 4, clampTo(s.trigger.nanosecond, 999_999_999))
+  putBe(result, 52, 4, uint64(s.sourceLine))
+  putBe(result, 56, 4, uint64(s.sourceStation))
+  putBe(result, 60, 4, uint64(s.shotId))
+  putBe(result, 64, 4, uint64(s.sourceIndex))
+  putBe(result, 68, 4, uint64(s.trailerCounter))
+  putBe(result, 72, 4, uint64(s.sweepId))
+  if s.gga.valid:
+    putFloat(result, 76, s.gga.latitudeDeg)
+    putFloat(result, 84, s.gga.longitudeDeg)
+    putFloat(result, 92, s.gga.altitudeM)
+    putFloat(result, 100, s.gga.geoidSeparationM)
+    putFloat32(result, 108, float32(s.gga.hdop))
+    result[112] = byte(clampTo(s.gga.fixQuality, 255))
+    result[113] = byte(clampTo(s.gga.satellites, 255))
+    result[114] = 1
+  else:
+    putFloat(result, 76, NaN)
+    putFloat(result, 84, NaN)
+  putFloat(result, 116, s.fix.latitudeDeg)
+  putFloat(result, 124, s.fix.longitudeDeg)
+  putBe(result, 132, 2, uint64(max(-32768, min(s.fix.heightDm, 32767)) and 0xFFFF))
+  result[134] = byte(clampTo(s.fix.fixQuality, 255))
+  result[135] = byte(clampTo(s.fix.satellites, 255))
+  result[136] = byte(clampTo(int(round(s.fix.hdop * 10)), 255))
+  putFloat(result, 144, opts.lbfPerCount)
+  putFloat(result, 152, opts.scale[dcReference])
+  putFloat(result, 160, opts.scale[dcMass])
+  putFloat(result, 168, opts.scale[dcBaseplate])
+  result[176] = byte(ord(opts.removeMean or opts.externalConverter.isSome))
+  result[177] = byte(ord(opts.groundForce or opts.externalConverter.isSome))
+  result[178] = 0 # polarity: always as recorded
+  result[179] = byte(ord(opts.positions))
+  for i in 0 ..< 76: # blanks, so that the map's `(trim right)` gives the words alone
+    result[180 + i] = if i < s.incompleteWhy.len: byte(s.incompleteWhy[i]) else: 0x20
+  for i, v in s.qc.raw:
+    result[256 + i] = v
+  for (kind, at) in [(0x80'u8, 512), (0x87'u8, 1024), (0x84'u8, 1536)]:
+    for i, v in recordBytes(s, kind):
+      result[at + i] = v
 
 proc fail(s: DatInfo; what: string) {.noinline, noreturn.} =
   raise newException(DatWriteError, "file number " & $s.fileNumber & ": " & what)
@@ -277,11 +391,21 @@ proc writeSegdTraces*(w: var SeismicWriter; s: DatShot; opts = DatWriteOptions()
   ## by the file number (records must not go backwards: sort shots by file number).
   ## No position is written: SEG-D has no place for geographic coordinates, and
   ## `opts.positions` is ignored. The trigger time is kept to the microsecond, the
-  ## resolution of SEG-D's timestamps. Raises `DatWriteError` (see the module's text).
+  ## resolution of SEG-D's timestamps. With `vendorLayout` the first trace of the
+  ## record carries the shot block as the record's external header. Raises
+  ## `DatWriteError` (see the module's text).
   checkOptions(s, opts, true)
+  var block0: seq[byte] = @[]
+  if opts.vendorLayout:
+    var o = opts
+    o.positions = dpNone # none is written in SEG-D, and the block says so
+    block0 = shotBlock(s, o)
+  var first = true
   for t in outTraces(s, opts, true, false):
     translating(s, "SEG-D"):
-      w.writeTrace(t.keys, t.samples, [], t.channelType)
+      w.writeTrace(t.keys, t.samples, [], t.channelType,
+        externalHeader = (if first: block0 else: @[]))
+    first = false
 
 func wrapped(cards: var seq[string]; text: string) =
   ## Adds `text` as cards of at most `CardWidth` characters, broken at spaces.
@@ -292,6 +416,16 @@ func wrapped(cards: var seq[string]; text: string) =
     cards.add rest[0 ..< at]
     rest = "  " & rest[at .. ^1].strip(trailing = false)
   cards.add rest
+
+func withShotCard*(cards: seq[string]): seq[string] =
+  ## `cards` as the first 36 cards (blank ones added) and card 37 `ShotCardText`, which
+  ## a SEG-Y file with shot stanzas must carry. Cards beyond the 36th are dropped.
+  result = cards
+  if result.len > RecognitionCard - 1:
+    result.setLen(RecognitionCard - 1)
+  while result.len < RecognitionCard - 1:
+    result.add ""
+  result.add ShotCardText
 
 func textCards*(s: DatInfo; opts: DatWriteOptions; positions = dpGga): seq[string] =
   ## The textual header cards of a SEG-Y file written from `s`: each at most 76
@@ -338,6 +472,8 @@ func textCards*(s: DatInfo; opts: DatWriteOptions; positions = dpGga): seq[strin
   if not s.complete:
     cards.wrapped "incomplete recording: " & s.incompleteWhy
   cards.wrapped "written by parseSSDAT " & PackageVersion
+  if opts.vendorLayout:
+    cards = withShotCard(cards)
   cards
 
 proc finish(w: var SeismicWriter) =
@@ -348,20 +484,40 @@ proc finish(w: var SeismicWriter) =
   if problems.len > 0:
     raise newException(IOError, problems.join("; "))
 
+proc addShotBlock*(w: var SeismicWriter; s: DatShot; opts = DatWriteOptions()) =
+  ## Adds the shot block of `s` to the open SEG-Y writer `w` as the stanza
+  ## `parseSSDAT:Shot v1`. Call it for every shot to go into the file, before the first
+  ## trace of any (parseSEG takes stanzas only then), and open the writer with a text
+  ## header that holds card 37 (`withShotCard`, which `textCards` applies with
+  ## `vendorLayout`). `writeSegy` does all of it for one shot. Raises `DatWriteError`.
+  checkOptions(s, opts, false)
+  translating(s, "SEG-Y"):
+    w.addStanza("parseSSDAT", "Shot v1", shotBlock(s, opts))
+
 proc writeSegy*(s: DatShot; path: string; opts = SegyOutputOptions();
     dat = DatWriteOptions()) =
   ## Writes `s` as a SEG-Y file at `path`, replacing a file there: one record, a trace
   ## per channel and the controller's ground force (see `DatWriteOptions`). When
   ## `opts.text` is empty the textual header names the file, the shot and the
-  ## channels, and says so for an incomplete recording. Raises `DatWriteError`, and
-  ## `IOError` with the writer's diagnostics when it reports any.
+  ## channels, and says so for an incomplete recording. With `dat.vendorLayout` the
+  ## shot block goes in as a stanza and card 37 names it (a text header of your own
+  ## keeps its first 36 cards and gets that card); Rev 0 has no stanzas and is
+  ## refused. Raises `DatWriteError`, and `IOError` with the writer's diagnostics when
+  ## it reports any.
   checkOptions(s, dat, false)
+  if dat.vendorLayout and opts.revision.major < 1:
+    fail(s, "the vendor layout needs SEG-Y Rev 1 or later (Rev 0 has no extended " &
+      "textual header): choose a later revision or set vendorLayout to false")
   var o = opts
   if o.text.len == 0:
     o.text = textCards(s, dat, dat.positions)
+  elif dat.vendorLayout:
+    o.text = withShotCard(o.text)
   var w: SeismicWriter
   translating(s, "SEG-Y"):
     w = openSeismicWriter(path, o)
+  if dat.vendorLayout:
+    w.addShotBlock(s, dat)
   w.writeSegyTraces(s, dat, opts.revision.major >= 2)
   translating(s, "SEG-Y"):
     w.finish()
@@ -369,8 +525,9 @@ proc writeSegy*(s: DatShot; path: string; opts = SegyOutputOptions();
 proc writeSegd*(s: DatShot; path: string; dat = DatWriteOptions()) =
   ## Writes `s` as a SEG-D Rev 3 file at `path`, replacing a file there: one record, a
   ## channel set per channel type, 32-bit float samples, the trigger time as the
-  ## recording time. No position is written and an incomplete recording is not flagged
-  ## in the file (SEG-D has no free text): see `writeSegdTraces`. Raises
+  ## recording time. No position is written; with `dat.vendorLayout` the shot block is
+  ## the record's external header, and it says whether the recording is complete (SEG-D
+  ## has no free text). See `writeSegdTraces`. Raises
   ## `DatWriteError`, and `IOError` with the writer's diagnostics when it reports any.
   checkOptions(s, dat, true)
   var w: SeismicWriter
