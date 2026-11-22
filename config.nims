@@ -3,6 +3,10 @@ import std/os
 
 switch("outdir", "bin")
 
+# The package itself is on the path for every build under this folder, whatever
+# nim.cfg holds: a dependency fetch rewrites nim.cfg and may drop a path line there.
+switch("path", thisDir() / "src")
+
 const tester = "c -r --hints:off --warnings:off tests/tester.nim"
 
 task test, "Run the tests: every tests/t*.nim, one process each":
