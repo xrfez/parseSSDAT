@@ -24,6 +24,17 @@ proc main() =
       removeFile(exe)
       if code != 0:
         failed.add name
+  # the libFuzzer target is not a test, but it must keep compiling: build it as the
+  # standalone replayer and run it on a few synthetic inputs
+  let fuzzExe = getTempDir() / ("ssdat-fuzzparse-" & $getCurrentProcessId())
+  echo "Running: fuzz/fuzzparse.nim (standalone)"
+  let fuzzCmd = quoteShell(getCurrentCompilerExe()) & " c -r --hints:off --warnings:off" &
+    flags & " -d:fuzzStandalone --panics:on --nimcache:" & quoteShell(getTempDir() /
+    "ssdat-nimcache-fuzzparse") & " -o:" & quoteShell(fuzzExe) & " " &
+    quoteShell(dir / "fuzz" / "fuzzparse.nim")
+  if execShellCmd(fuzzCmd) != 0:
+    failed.add "fuzz/fuzzparse.nim"
+  removeFile(fuzzExe)
   if failed.len > 0:
     quit "FAILURE " & failed.join(", ")
   echo "All test files completed."
