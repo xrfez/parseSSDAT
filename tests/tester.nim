@@ -25,11 +25,14 @@ proc main() =
       if code != 0:
         failed.add name
   # the libFuzzer target is not a test, but it must keep compiling: build it as the
-  # standalone replayer and run it on a few synthetic inputs
+  # standalone replayer and run it on a few synthetic inputs. The path to `src` is
+  # given here: tests/config.nims does not reach tests/fuzz/, and nim.cfg's own line
+  # for it is not something `atlas rep` keeps.
   let fuzzExe = getTempDir() / ("ssdat-fuzzparse-" & $getCurrentProcessId())
   echo "Running: fuzz/fuzzparse.nim (standalone)"
   let fuzzCmd = quoteShell(getCurrentCompilerExe()) & " c -r --hints:off --warnings:off" &
-    flags & " -d:fuzzStandalone --panics:on --nimcache:" & quoteShell(getTempDir() /
+    flags & " -d:fuzzStandalone --panics:on --path:" & quoteShell(dir.parentDir / "src") &
+    " --nimcache:" & quoteShell(getTempDir() /
     "ssdat-nimcache-fuzzparse") & " -o:" & quoteShell(fuzzExe) & " " &
     quoteShell(dir / "fuzz" / "fuzzparse.nim")
   if execShellCmd(fuzzCmd) != 0:
