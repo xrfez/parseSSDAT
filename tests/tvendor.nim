@@ -293,7 +293,7 @@ proc main*() =
     let bl = f.blocksOf(reg)
     doAssert bl.len == 1
     let v = byName(bl[0])
-    checkFields(v, noQc, DatWriteOptions(), dpGga)
+    checkFields(v, noQc, DatWriteOptions(), dpNone) # no GGA: none written
     doAssert v["ggaLatitude"].floatVal.isNaN and v["ggaValid"].intVal == 0
     checkRaw(f.rawBlocks[0], noQc)
     f.close()
@@ -411,6 +411,102 @@ proc main*() =
     s.writeSegy(dir / "t.sgy", SegyOutputOptions(text: cards), DatWriteOptions(vendorLayout: false))
     # (no card 37 in a user's text header without the layout: no block is decoded)
     doAssert openSeismic(dir / "t.sgy").blocksOf(reg).len == 0
+
+  block blockLimits:
+    ## A shot that does not fit the block is refused in words, never wrapped or
+    ## overwritten; with the layout off it is written.
+    proc refused(sh: DatShot; words: openArray[string]; dat = DatWriteOptions()) =
+      for segd in [false, true]:
+        let p = dir / "limit.out"
+        try:
+          if segd: sh.writeSegd(p, dat) else: sh.writeSegy(p, dat = dat)
+          doAssert false, "was written: " & $words
+        except DatWriteError as e:
+          for w in words:
+            doAssert w in e.msg, w & " not in " & e.msg
+        doAssert not fileExists(p)
+    for (name, tweak) in [("controller serial", proc (x: var DatShot) = x.controllerSerial = -1),
+        ("file number", proc (x: var DatShot) = x.fileNumber = 1'i64 shl 40),
+        ("source line", proc (x: var DatShot) = x.sourceLine = 4_294_967_296'i64),
+        ("source station", proc (x: var DatShot) = x.sourceStation = -5),
+        ("shot id", proc (x: var DatShot) = x.shotId = 1'i64 shl 33),
+        ("sweep id", proc (x: var DatShot) = x.sweepId = -1),
+        ("source index", proc (x: var DatShot) = x.sourceIndex = 1'i64 shl 32),
+        ("trailer counter", proc (x: var DatShot) = x.trailerCounter = -2)]:
+      var sh = s
+      tweak(sh)
+      refused(sh, [name, "32 bits", "vendorLayout"])
+      var plain = sh # the same shot without the layout: only SEG-Y can hold some values
+      plain.sourceIndex = min(plain.sourceIndex, 3)
+      if name in ["trailer counter", "sweep id", "shot id"]:
+        plain.writeSegy(dir / "plain.sgy", dat = DatWriteOptions(vendorLayout: false))
+    var odd = s
+    odd.trigger = DatTime(year: 70000, month: 300, day: 1, hour: 99999, minute: 0, second: 0,
+      nanosecond: 1_000_000_000)
+    refused(odd, ["trigger time", "shot block"])
+    # the QC record and the raw records have their sizes
+    for n in [1, 239, 241, 300, 1792, 1793, 100000]:
+      var sh = s
+      sh.qc.raw = newSeq[byte](n)
+      refused(sh, ["QC record", $n & " bytes", "not 240"])
+    var short = s
+    short.records[0].bytes.setLen(511)
+    refused(short, ["raw record", "511 bytes", "not 512"])
+    var long = s
+    long.records[2].bytes.setLen(513)
+    refused(long, ["raw record", "513 bytes"])
+    var empty = s
+    empty.qc.raw.setLen(0) # no QC record is fine
+    empty.qc.valid = false
+    empty.writeSegy(dir / "e.sgy")
+    refused(s, ["pound-force per count", "-1.0"], DatWriteOptions(lbfPerCount: -1.0))
+    refused(s, ["pound-force per count", "nan"], DatWriteOptions(lbfPerCount: NaN))
+    refused(s, ["pound-force per count", "inf"], DatWriteOptions(lbfPerCount: Inf))
+    doAssertRaises(DatWriteError):
+      s.writeSegy(dir / "neg.sgy", dat = DatWriteOptions(lbfPerCount: -0.5, vendorLayout: false))
+    # a record that is the wrong size is not looked at when the layout is off
+    short.writeSegy(dir / "s.sgy", dat = DatWriteOptions(vendorLayout: false))
+
+  block positionsWritten:
+    ## The positions byte and the text say what was written: none, for a GGA position
+    ## asked of a shot without a valid sentence or a fix asked of one without a fix.
+    let noGga = parseDat(synthDat(SynthDat(samples: 60, text: "no gga here")))
+    var noFix = parseDat(synthDat(SynthDat(samples: 60)))
+    noFix.fix.latitudeDeg = NaN
+    doAssert writtenPositions(noGga, dpGga) == dpNone and writtenPositions(s, dpGga) == dpGga
+    doAssert writtenPositions(noFix, dpFix) == dpNone and writtenPositions(noFix, dpGga) == dpGga
+    doAssert writtenPositions(noGga, dpFix) == dpFix and writtenPositions(s, dpNone) == dpNone
+    doAssert shotBlock(noGga, DatWriteOptions(positions: dpGga))[179] == 0
+    doAssert shotBlock(noFix, DatWriteOptions(positions: dpFix))[179] == 0
+    doAssert shotBlock(s, DatWriteOptions(positions: dpGga))[179] == 1
+    doAssert shotBlock(s, DatWriteOptions(positions: dpFix))[179] == 2
+    noGga.writeSegy(dir / "ng.sgy")
+    var f = openSeismic(dir / "ng.sgy", keys = true)
+    doAssert "no coordinates written" in f.textHeader and f.traceKeys(0).srcX.isNaN
+    doAssert f.blocksOf(reg)[0].byName["positions"].intVal == 0
+    f.close()
+    noFix.writeSegy(dir / "nf.sgy", dat = DatWriteOptions(positions: dpFix))
+    f = openSeismic(dir / "nf.sgy", keys = true)
+    doAssert "no coordinates written" in f.textHeader
+    doAssert f.blocksOf(reg)[0].byName["positions"].intVal == 0
+    f.close()
+
+  block incompleteWordsCut:
+    ## The reason is cut at the last space within 76 characters, not in a word.
+    var sh = s
+    sh.complete = false
+    sh.incompleteWhy = "the file holds 50 of the 226 blocks its header announces: the " &
+      "recording stopped or the copy was cut short"
+    let b = shotBlock(sh, DatWriteOptions())
+    let text = cast[string](b[180 ..< 256]).strip(leading = false)
+    doAssert text == "the file holds 50 of the 226 blocks its header announces: the recording",
+      text
+    doAssert text.len <= 76 and sh.incompleteWhy.startsWith(text)
+    sh.incompleteWhy = "x".repeat(200) # no space: cut at 76
+    doAssert cast[string](shotBlock(sh, DatWriteOptions())[180 ..< 256]) == "x".repeat(76)
+    sh.incompleteWhy = "short words"
+    doAssert cast[string](shotBlock(sh, DatWriteOptions())[180 ..< 256]).strip(
+      leading = false) == "short words"
 
   block refusals:
     ## Rev 0 has no stanzas: refused in words, or written plain.

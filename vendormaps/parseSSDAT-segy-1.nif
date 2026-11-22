@@ -48,7 +48,7 @@
     (field fixQuality (at 135) (enc u8))
     (field fixSatellites (at 136) (enc u8))
     (field fixHdop (at 137) (enc u8) (scale 0.1))
-    (field lbfPerCount (at 145) (enc f64) (unit "lbf") (sentinel 0))
+    (field lbfPerCount (at 145) (enc f64) (unit "lbf")) ; 0: not given
     (field scaleReference (at 153) (enc f64))
     (field scaleMass (at 161) (enc f64))
     (field scaleBaseplate (at 169) (enc f64))

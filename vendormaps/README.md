@@ -19,5 +19,7 @@ The block is 2048 bytes, big-endian: 8 bytes `SSDATSHT`, the layout version and 
 block length, the decoded header, position and trailer values, the 240-byte QC record
 verbatim from byte 257 (its fields and the 128-value correlation series decoded by name,
 `qc...` and `corr[i]`), and the three raw 512-byte records of the file. Unused bytes are
-0, and a latitude or longitude that is NaN means none. The samples are not in it, and
+0, and a latitude or longitude that is NaN means none. `gnssText` and the raw records are
+the file's own bytes, NUL padding included: a reader stops at the first NUL. `lbfPerCount`
+is 0 when none was given. The samples are not in it, and
 neither is a flipped sign: the ground force is written as recorded.

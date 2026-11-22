@@ -40,6 +40,9 @@ const
   CardWidth = 76           ## parseSEG puts "C nn " before each textual header card of 80
   RecognitionCard = 37     ## the textual header card that names the shot stanzas
   ShotLayoutVersion = 1
+  QcRecordBytes = 240      ## the QC record the block holds
+  RawRecordBytes = 512     ## each of the three raw records (one block of the file)
+  MaxCards = 38            ## textual header cards a writer takes
   MaxSegdSourceIndex = 255
   MaxSegdFileNumber = 16_777_215
 
@@ -157,6 +160,23 @@ func toTraceKeys*(s: DatInfo; c: DatChannel; positions = dpNone): TraceKeys =
   result.rcvY = result.srcY
   result.rcvZ = result.srcZ
 
+func writtenPositions*(s: DatInfo; positions: DatPositions): DatPositions =
+  ## The positions that are written for `s` when `positions` is asked: `dpNone` when the
+  ## shot has none of that kind (`dpGga` without a valid GGA sentence, `dpFix` with no
+  ## fix).
+  result = positions
+  if (positions == dpGga and not s.gga.valid) or (positions == dpFix and
+      (s.fix.latitudeDeg.isNaN or s.fix.longitudeDeg.isNaN)):
+    result = dpNone
+
+func incompleteWords(why: string): string =
+  ## `why` cut at the last space within 76 characters: the room the block has.
+  if why.len <= 76:
+    result = why
+  else:
+    let at = why.rfind(' ', 0, 76)
+    result = if at > 0: why[0 ..< at] else: why[0 ..< 76]
+
 proc putBe(b: var seq[byte]; at, width: int; v: uint64) =
   for i in 0 ..< width:
     b[at + i] = byte((v shr (8 * (width - 1 - i))) and 0xFF)
@@ -181,11 +201,11 @@ proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
   ## record and the file's header, position and trailer records, verbatim (so the bytes
   ## nobody has decoded survive). Big-endian, laid out as the vendor maps in
   ## `vendormaps/` say (byte 1 `SSDATSHT`, layout version 1, block length 2048). Unused
-  ## bytes are 0 (the 76 of `incompleteWhy` are blanks, and the words are cut at 76
-  ## characters: the block has no more room for them); a latitude or longitude that is NaN means none; a record the shot has
+  ## bytes are 0 (the 76 of `incompleteWhy` are blanks, and the words are cut at the last
+  ## space within 76 characters: the block has no more room for them); a latitude or longitude that is NaN means none; a record the shot has
   ## not got (a stopped recording has no trailer) is zeros. `opts` supplies what the
   ## shot does not hold: the scale factors, mean removal, ground force trace, the
-  ## positions asked for and `lbfPerCount`. The samples are not in it, and no sign is
+  ## positions that are written (`writtenPositions`) and `lbfPerCount`. The samples are not in it, and no sign is
   ## changed anywhere.
   result = newSeq[byte](ShotBlockBytes)
   for i, c in ShotMagic:
@@ -239,9 +259,10 @@ proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
   result[176] = byte(ord(opts.removeMean or opts.externalConverter.isSome))
   result[177] = byte(ord(opts.groundForce or opts.externalConverter.isSome))
   result[178] = 0 # polarity: always as recorded
-  result[179] = byte(ord(opts.positions))
+  result[179] = byte(ord(writtenPositions(s, opts.positions)))
+  let why = incompleteWords(s.incompleteWhy)
   for i in 0 ..< 76: # blanks, so that the map's `(trim right)` gives the words alone
-    result[180 + i] = if i < s.incompleteWhy.len: byte(s.incompleteWhy[i]) else: 0x20
+    result[180 + i] = if i < why.len: byte(why[i]) else: 0x20
   for i, v in s.qc.raw:
     result[256 + i] = v
   for (kind, at) in [(0x80'u8, 512), (0x87'u8, 1024), (0x84'u8, 1536)]:
@@ -266,6 +287,35 @@ func source(c: DatChannel; swap: bool): DatChannel =
 func positive(v: float64): bool =
   v > 0 and v < Inf
 
+proc checkBlockFields(s: DatShot) =
+  ## The shot block holds 32-bit fields and a 240-byte QC record and three 512-byte
+  ## records: refuse a shot that does not fit them, in words, rather than wrap or
+  ## overwrite.
+  for (name, v) in [("controller serial", s.controllerSerial),
+      ("file number", s.fileNumber), ("declared samples", int64(s.declaredSamples)),
+      ("samples", int64(s.len)), ("source line", s.sourceLine),
+      ("source station", s.sourceStation), ("shot id", s.shotId),
+      ("source index", s.sourceIndex), ("trailer counter", s.trailerCounter),
+      ("sweep id", s.sweepId)]:
+    if v < 0 or v > 4_294_967_295'i64:
+      fail(s, "the " & name & " " & $v & " does not fit the 32 bits of the shot block " &
+        "(set vendorLayout to false to write the file without it)")
+  let t = s.trigger
+  if t.year notin 0 .. 65535 or t.month notin 0 .. 255 or t.day notin 0 .. 255 or
+      t.hour notin 0 .. 255 or t.minute notin 0 .. 255 or t.second notin 0 .. 255 or
+      t.nanosecond notin 0 .. 999_999_999:
+    fail(s, "the trigger time " & $t.year & "-" & $t.month & "-" & $t.day & " " & $t.hour &
+      ":" & $t.minute & ":" & $t.second & "." & $t.nanosecond &
+      " does not fit the shot block")
+  if s.firmware.major notin 0 .. 255 or s.firmware.minor notin 0 .. 255:
+    fail(s, "the firmware version does not fit the shot block")
+  if s.qc.raw.len notin [0, QcRecordBytes]:
+    fail(s, "the QC record has " & $s.qc.raw.len & " bytes, not " & $QcRecordBytes)
+  for r in s.records:
+    if r.bytes.len != RawRecordBytes:
+      fail(s, "a raw record of the file has " & $r.bytes.len & " bytes, not " &
+        $RawRecordBytes)
+
 proc checkOptions(s: DatShot; opts: DatWriteOptions; segd: bool) =
   ## Everything that makes a shot or the options unwritable and that parseSEG would
   ## say in its own words, said in ours.
@@ -275,6 +325,11 @@ proc checkOptions(s: DatShot; opts: DatWriteOptions; segd: bool) =
     if s.data[c].len != s.len:
       fail(s, "the " & $c & " channel has " & $s.data[c].len & " samples, the " &
         "reference " & $s.len)
+  if not (opts.lbfPerCount >= 0 and opts.lbfPerCount < Inf):
+    fail(s, "the pound-force per count is " & $opts.lbfPerCount &
+      ", not a number of 0 or more (0 means none given)")
+  if opts.vendorLayout:
+    checkBlockFields(s)
   if opts.externalConverter.isSome:
     let c = opts.externalConverter.get
     for (name, v) in [("reaction-mass weight", c.reactionMassWeight),
@@ -376,7 +431,7 @@ proc writeSegyTraces*(w: var SeismicWriter; s: DatShot; opts = DatWriteOptions()
   ## 16 bits. Raises `DatWriteError` (see the module's text).
   checkOptions(s, opts, false)
   var overrides: seq[HeaderOverride] = @[]
-  if opts.positions != dpNone:
+  if writtenPositions(s, opts.positions) != dpNone:
     overrides.add headerOverride("trace.coordinateUnits", 2)
   if s.qc.valid and s.qc.vibratorId <= int(high(int16)):
     overrides.add headerOverride("trace.deviceTraceId", s.qc.vibratorId)
@@ -412,7 +467,7 @@ func wrapped(cards: var seq[string]; text: string) =
   var rest = text
   while rest.len > CardWidth:
     var at = rest.rfind(' ', 0, CardWidth)
-    if at <= 0: at = CardWidth
+    if at <= 2: at = CardWidth # no space to break at (the indent counts): cut the word
     cards.add rest[0 ..< at]
     rest = "  " & rest[at .. ^1].strip(trailing = false)
   cards.add rest
@@ -472,6 +527,7 @@ func textCards*(s: DatInfo; opts: DatWriteOptions; positions = dpGga): seq[strin
   if not s.complete:
     cards.wrapped "incomplete recording: " & s.incompleteWhy
   cards.wrapped "written by parseSSDAT " & PackageVersion
+  if cards.len > MaxCards: cards.setLen(MaxCards)
   if opts.vendorLayout:
     cards = withShotCard(cards)
   cards
@@ -510,7 +566,7 @@ proc writeSegy*(s: DatShot; path: string; opts = SegyOutputOptions();
       "textual header): choose a later revision or set vendorLayout to false")
   var o = opts
   if o.text.len == 0:
-    o.text = textCards(s, dat, dat.positions)
+    o.text = textCards(s, dat, writtenPositions(s, dat.positions))
   elif dat.vendorLayout:
     o.text = withShotCard(o.text)
   var w: SeismicWriter

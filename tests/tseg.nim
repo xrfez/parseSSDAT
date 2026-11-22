@@ -552,6 +552,37 @@ proc main*() =
     doAssertRaises(DatWriteError): # asking for the extension a Rev 1 file has not got
       w3.writeSegyTraces(s, extHeader = true)
 
+  block longWords:
+    ## A word longer than a card is cut, not looped over; the cards stay within 80
+    ## characters in the file whatever the shot holds.
+    var odd = s
+    odd.complete = false
+    odd.incompleteWhy = "x".repeat(300)
+    odd.trigger = DatTime(year: 1_000_000_000, month: 1_000_000_000, day: 1_000_000_000,
+      hour: 1_000_000_000, minute: 1_000_000_000, second: 1_000_000_000,
+      nanosecond: 999_999_999)
+    for c in textCards(odd, DatWriteOptions()):
+      doAssert c.len <= 76, c
+    doAssert textCards(odd, DatWriteOptions()).len <= 38
+    let big = textCards(odd, DatWriteOptions(vendorLayout: false))
+    var xs = 0
+    for c in big:
+      if c.strip.len > 0 and c.strip.allCharsInSet({'x'}): xs += c.strip.len
+    doAssert big.len > 4 and xs == 300, $xs
+    # in the file (the layout off: the trigger would not fit the block)
+    odd.writeSegy(dir / "long.sgy", dat = DatWriteOptions(vendorLayout: false))
+    var f = openSeismic(dir / "long.sgy")
+    for line in f.textHeader.splitLines:
+      doAssert line.len == 80
+    f.close()
+    # a long reason only: with the layout on
+    var long = s
+    long.complete = false
+    long.incompleteWhy = "y".repeat(500)
+    long.writeSegy(dir / "long2.sgy")
+    doAssert textCards(long, DatWriteOptions()).len <= 37
+    doAssert "y".repeat(50) in openSeismic(dir / "long2.sgy").textHeader
+
   block unwritable:
     doAssertRaises(CatchableError):
       s.writeSegy(dir / "no" / "such" / "folder" / "x.sgy")
