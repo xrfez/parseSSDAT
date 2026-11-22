@@ -482,6 +482,86 @@ proc main*() =
     let o = parseDat(synthDat(odd))
     doAssert o.qc.valid and o.qc.trigger.month == 13 and o.qc.trigger.year == 2030
 
+  block ggaOverflow:
+    ## A GGA quality or satellite field of many digits is not a number that fits: the
+    ## sentence does not parse, and nothing overflows, whichever way the file is read.
+    for text in ["9600 bps;$GPGGA,040506.00,1230.500000,N,04530.250000,E," &
+        "99999999999999999999,8,0.9,100.0,M,10.0,M,,*hh\r\n",
+        "9600 bps;$GPGGA,040506.00,1230.500000,N,04530.250000,E,1," &
+        "9999999999999999999999999,0.9,100.0,M,10.0,M,,*hh\r\n",
+        "9600 bps;$GPGGA,040506.00,1230.500000,N,04530.250000,E,1234567,8,0.9,1.0,M,,M\r\n",
+        "9600 bps;$GPGGA,040506.00,1230.500000,N,04530.250000,E,1,1234567,0.9,1.0,M,,M\r\n"]:
+      let d = synthDat(SynthDat(samples: 60, text: text))
+      doAssert not parseDat(d).gga.valid
+      var shot: DatShot
+      decodeInto(shot, d)
+      doAssert not shot.gga.valid
+      doAssert not parseDatInfo(d).gga.valid
+      doAssert not parseGga(text).valid
+    # six digits are the most a count may have
+    let ok = parseGga("$GPGGA,040506.00,1230.5,N,04530.25,E,123456,000012,0.9,1.0,M,,M")
+    doAssert ok.valid and ok.fixQuality == 123456 and ok.satellites == 12
+    let dir = getTempDir() / ("ssdat-gga-" & $getCurrentProcessId())
+    createDir(dir)
+    try:
+      writeFile(dir / "g.dat", cast[string](synthDat(SynthDat(samples: 60,
+          text: "9600 bps;$GPGGA,040506.00,1230.5,N,04530.25,E," &
+          "99999999999999999999,8,0.9,1.0,M,,M\r\n"))))
+      doAssert not readDatInfo(dir / "g.dat").gga.valid
+    finally:
+      removeDir(dir)
+
+  block qcFields:
+    ## Every decoded QC field round-trips; the series is empty when not stored.
+    var corr = newSeq[int8](128)
+    for i in 0 ..< 128:
+      corr[i] = int8((i * 37) mod 256 - 128)
+    corr[64] = -126
+    var s = SynthDat(samples: 100, crew: 9, vibrator: 77, sweepNumber: 16, sweepId: 123456,
+      sweepChecksum: 0xBEEF, paramChecksum: 0xCAFE, shotId: 31, line: 41, station: 51,
+      phaseByte: 13, forceMax: 66, forceMin: 55, forceAvg: 60, thdMax: 12, thdAvg: 5,
+      status: [3'u8, 4, 5, 0b01010], corrMagnitude: 54321, corr: corr, heightCm: 4_000_000_000'i64,
+      qcSatellites: 12, dops: [21, 11, 18], correctionAge: 7, stiffness: [255, 100, 200],
+      viscosity: [80, 30, 50], targetForce: 54321)
+    for qc in [97, 99, 100]:
+      s.qcOffset = qc
+      let q = parseDat(synthDat(s)).qc
+      doAssert q.valid and q.crew == 9 and q.vibratorId == 77 and q.sweepNumber == 16
+      doAssert q.sweepId == 123456 and q.sweepChecksum == 0xBEEF'u16 and
+        q.paramChecksum == 0xCAFE'u16
+      doAssert q.phaseMaxDeg == 13.0 / 8
+      doAssert q.forceMaxPct == 66 and q.forceMinPct == 55 and q.forceAvgPct == 60
+      doAssert q.thdMaxPct == 12 and q.thdAvgPct == 5
+      doAssert q.limits == {dlM, dlF} and q.statusFlags == [3'u8, 4, 5, 0b01010]
+      doAssert q.correlationMagnitude == 54321 and q.correlation == corr
+      doAssert q.heightCm == 4_000_000_000'i64 and q.satellites == 12
+      doAssert q.pdop == 2.1 and q.hdop == 1.1 and q.vdop == 1.8 and q.correctionAgeS == 7
+      doAssert q.stiffness == (255, 100, 200) and q.viscosity == (80, 30, 50)
+      doAssert q.targetForceLbf == 54321
+      doAssert q.shotId == 31 and q.sourceLine == 41 and q.sourceStation == 51
+    # the limit letters, one bit each
+    for (bits, want) in [(0b00001'u8, {dlT}), (0b00010'u8, {dlM}), (0b00100'u8, {dlV}),
+        (0b01000'u8, {dlF}), (0b10000'u8, {dlR}), (0'u8, {}), (0b11111'u8, {dlT, dlM, dlV,
+        dlF, dlR}), (0b11100000'u8, {})]:
+      s.status[3] = bits
+      doAssert parseDat(synthDat(s)).qc.limits == want, $bits
+    # a series that is not stored: no values, magnitude 0
+    s.noCorr = true
+    let n = parseDat(synthDat(s)).qc
+    doAssert n.valid and n.correlation.len == 0 and n.correlationMagnitude == 0
+    doAssert n.targetForceLbf == 54321
+    # no QC record: every field at its default, also when a shot is reused
+    var shot: DatShot
+    decodeInto(shot, synthDat(s))
+    doAssert shot.qc.valid
+    s.noCorr = false
+    decodeInto(shot, synthDat(s))
+    doAssert shot.qc.correlation == corr
+    decodeInto(shot, synthDat(SynthDat(samples: 100, noQc: true)))
+    doAssert shot.qc == DatQc()
+    # the info has them too
+    doAssert parseDatInfo(synthDat(s)).qc == parseDat(synthDat(s)).qc
+
   block bigNumbers:
     ## Numbers of 2^31 and above are numbers, not a RangeDefect on a 32-bit build.
     let s = SynthDat(samples: 60, serial: 0xFFFF_FFFF, fileNumber: 0xFFFF_FFFF)
@@ -522,6 +602,13 @@ proc main*() =
       trigger: DatTime(year: 2024, month: 12, day: 31, hour: 23, minute: 59, second: 59,
       nanosecond: 5))))
     doAssert datFileStem(b) == "0007_20241231T235959.000000005Z"
+    # a serial of 2^31 and above is a number too; a wide one gives a wide stem
+    let wide = parseDat(synthDat(SynthDat(samples: 60, serial: 0xFFFF_FFFF)))
+    doAssert datFileStem(wide).startsWith("4294967295_2001")
+    doAssert datFileStem(parseDat(synthDat(SynthDat(samples: 60, serial: 99999)))).startsWith(
+      "99999_2001")
+    doAssert datFileStem(parseDat(synthDat(SynthDat(samples: 60, serial: 12)))).startsWith(
+      "0012_2001")
     doAssert datFileStem(parseDatInfo(synthDat(SynthDat(samples: 60)))) == datFileStem(a)
     for c in datFileStem(a):
       doAssert c notin {':', '\\', '/', '*', '?', '"', '<', '>', '|', ' '}
@@ -535,6 +622,11 @@ proc main*() =
     s.data[dcBaseplate] = @[-1'i32, 6, 8_388_607]
     let a = parseDat(synthDat(s))
     doAssert a.groundForce == @[-8_388_609'i32, 11, 16_777_214]
+    var broken = a
+    broken.data[dcBaseplate].setLen(2)
+    doAssertRaises(ValueError):
+      discard broken.groundForce
+
 
   block info:
     ## `parseDatInfo` gives what a file list needs from three blocks.

@@ -25,11 +25,14 @@ const
   TextEnd = 491
   QcStart = 97          ## the first block offset where the QC record may begin
   QcBytes = 240
+  CorrelationValues = 128
   MaxBlocks = MaxDatBytes div DatBlockBytes
   Pow10 = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13,
     1e14, 1e15]
 
 type DatBlock = array[DatBlockBytes, byte]
+
+const EmptyBlock: DatBlock = default(DatBlock)
 
 func blockAt(data: openArray[byte]; k: int): DatBlock =
   ## A copy of block `k` (0-based) of `data`, which must hold it whole.
@@ -78,17 +81,19 @@ func `$`*(t: DatTime): string =
 
 func datFileStem*(s: DatInfo): string =
   ## A file name (without extension) for output made from `s`: the controller's
-  ## serial number in four digits and the exact trigger time, UTC, to the
-  ## nanosecond: `0042_20010203T040506.789000000Z`. It sorts by controller, then
-  ## time, and holds no character Windows forbids.
+  ## serial number, zero-padded to four digits (a serial above 9999 gives a wider
+  ## stem), and the exact trigger time, UTC, to the nanosecond:
+  ## `0042_20010203T040506.789000000Z`. It sorts by controller, then time (for serials
+  ## of the same width), and holds no character Windows forbids.
   let t = s.trigger
-  intToStr(int(s.controllerSerial mod 10_000_000_000'i64), 4) & "_" &
+  let serial = $s.controllerSerial
+  repeat('0', max(0, 4 - serial.len)) & serial & "_" &
     intToStr(t.year, 4) & intToStr(t.month, 2) & intToStr(t.day, 2) & "T" &
     intToStr(t.hour, 2) & intToStr(t.minute, 2) & intToStr(t.second, 2) & "." &
     intToStr(t.nanosecond, 9) & "Z"
 
 func len*(s: DatShot): int =
-  ## Samples per channel present.
+  ## Samples per channel present (those of the reference channel).
   s.data[dcReference].len
 
 func samples*(s: DatShot; c: DatChannel): seq[float32] =
@@ -100,7 +105,14 @@ func samples*(s: DatShot; c: DatChannel): seq[float32] =
 func groundForce*(s: DatShot): seq[int32] =
   ## The controller's ground force, estimated: the plain sum of its two force
   ## channels (reaction mass and baseplate), in counts. Each channel is below
-  ## 2^23 in magnitude, so the sum cannot overflow.
+  ## 2^23 in magnitude, so the sum cannot overflow. The file's ground force is
+  ## opposite in sign to its reference (180 degrees from it) in every sweep where
+  ## that can be told, and the library never changes the sign: this is the sum as
+  ## recorded. Raises `ValueError` when the two channels differ in length (a shot
+  ## that was not decoded from a file).
+  if s.data[dcMass].len != s.data[dcBaseplate].len:
+    raise newException(ValueError, "the reaction-mass and baseplate force channels " &
+      "have " & $s.data[dcMass].len & " and " & $s.data[dcBaseplate].len & " samples")
   result = newSeq[int32](s.len)
   for i in 0 ..< result.len:
     result[i] = s.data[dcMass][i] + s.data[dcBaseplate][i]
@@ -181,10 +193,11 @@ func optCount(t: string; s0, stop, i: int; v: var int): bool =
   v = 0
   result = true
   if fieldAt(t, s0, stop, i, a, b) and a < b:
-    result = b - a <= 6
-    for j in a ..< b:
-      if t[j] in Digits: v = v * 10 + (ord(t[j]) - ord('0'))
-      else: result = false
+    result = b - a <= 6 # the length first: a longer run of digits would overflow `v`
+    if result:
+      for j in a ..< b:
+        if t[j] in Digits: v = v * 10 + (ord(t[j]) - ord('0'))
+        else: result = false
 
 func hemisphere(t: string; s0, stop, i: int; plus, minus: char): int =
   ## 1 for `plus`, -1 for `minus`, 0 when field `i` is neither.
@@ -281,28 +294,61 @@ func ns32(v: int64): int =
 func fillQc(q: var DatQc; b: openArray[byte]; length: int) =
   ## The embedded QC record: the first `46 33 00 E7` from block offset 97 whose 240
   ## bytes end within the record.
-  q.valid = false
-  q.raw.setLen(0)
+  var raw = move(q.raw) # the buffers are kept between files
+  var corr = move(q.correlation)
+  q = DatQc()
+  raw.setLen(0)
+  corr.setLen(0)
   var at = QcStart
   while at + QcBytes <= length + 2 and not q.valid:
     if b[at] == 0x46 and b[at + 1] == 0x33 and b[at + 2] == 0 and b[at + 3] == 0xE7:
       q.valid = true
-      q.raw.setLen(QcBytes)
+      raw.setLen(QcBytes)
       for i in 0 ..< QcBytes:
-        q.raw[i] = b[at + i]
+        raw[i] = b[at + i]
       q.crew = int(b[at + 4])
       q.vibratorId = int(b[at + 6])
       q.sweepId = u32be(b, at + 9)
       q.sweepNumber = int(b[at + 13])
-      q.sweepChecksum = u16be(b, at + 24)
-      q.paramChecksum = u16be(b, at + 26)
+      q.phaseMaxDeg = float64(b[at + 16]) / 8
+      q.forceMaxPct = int(b[at + 19])
+      q.forceMinPct = int(b[at + 20])
+      q.forceAvgPct = int(b[at + 21])
+      q.thdMaxPct = int(b[at + 22])
+      q.thdAvgPct = int(b[at + 23])
+      q.sweepChecksum = uint16(u16be(b, at + 24))
+      q.paramChecksum = uint16(u16be(b, at + 26))
+      for i in 0 .. 3:
+        q.statusFlags[i] = b[at + 28 + i]
+      for l in DatLimit:
+        if (b[at + 31] and (1'u8 shl ord(l))) != 0: q.limits.incl l
+      q.correlationMagnitude = u16be(b, at + 36)
+      # a record that stores no series has the magnitude 0 and every value 1
+      var stored = q.correlationMagnitude != 0
+      for i in 0 ..< CorrelationValues:
+        if b[at + 38 + i] != 1: stored = true
+      if stored:
+        corr.setLen(CorrelationValues)
+        for i in 0 ..< CorrelationValues:
+          corr[i] = cast[int8](b[at + 38 + i])
       q.trigger = DatTime(year: 2000 + int(b[at + 166]), month: int(b[at + 167]),
         day: int(b[at + 168]), hour: int(b[at + 169]), minute: int(b[at + 170]),
         second: int(b[at + 171]), nanosecond: ns32(u32be(b, at + 172)))
+      q.heightCm = u32be(b, at + 185)
+      q.satellites = int(b[at + 189])
+      q.pdop = float64(b[at + 190]) / 10
+      q.hdop = float64(b[at + 191]) / 10
+      q.vdop = float64(b[at + 192]) / 10
+      q.correctionAgeS = int(b[at + 193])
+      q.stiffness = (int(b[at + 203]), int(b[at + 204]), int(b[at + 205]))
+      q.viscosity = (int(b[at + 206]), int(b[at + 207]), int(b[at + 208]))
+      q.targetForceLbf = u16be(b, at + 209)
       q.shotId = u32be(b, at + 218)
       q.sourceLine = u32be(b, at + 222)
       q.sourceStation = u32be(b, at + 226)
     inc at
+  q.raw = move(raw)
+  q.correlation = move(corr)
 
 proc fillHeader(s: var DatInfo; b: openArray[byte]; offset: int64) =
   s.firmware = (int(b[20]), int(b[21]))
@@ -438,18 +484,7 @@ proc beginInfo(s: var DatInfo; head: RecordHead; declared: int; interval: float6
   s.sourceIndex = 0
   s.sweepId = 0
   s.trailerCounter = 0
-  s.qc.valid = false
-  s.qc.raw.setLen(0)
-  s.qc.crew = 0
-  s.qc.vibratorId = 0
-  s.qc.sweepId = 0
-  s.qc.sweepNumber = 0
-  s.qc.sweepChecksum = 0
-  s.qc.paramChecksum = 0
-  s.qc.trigger = DatTime()
-  s.qc.shotId = 0
-  s.qc.sourceLine = 0
-  s.qc.sourceStation = 0
+  fillQc(s.qc, EmptyBlock, 0) # no record: every QC field back to its default
 
 # ------------------------------------------------------------- the info --
 

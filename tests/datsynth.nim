@@ -10,31 +10,48 @@ type
   Place* = tuple[deg: int, minE6: int, hemi: char]
 
   SynthDat* = object
-    serial*: int = 4321                  ## the controller serial number
-    fileNumber*: int = 7001
+    serial*: int64 = 4321                              ## the controller serial number
+    fileNumber*: int64 = 7001
     firmware*: tuple[major, minor: int] = (1, 2)
     trigger*: DatTime = DatTime(year: 2001, month: 2, day: 3, hour: 4, minute: 5,
       second: 6, nanosecond: 789_000_000)
-    samples*: int = 120                  ## per channel
-    data*: array[DatChannel, seq[int32]] ## empty: a deterministic chirp with noise
+    samples*: int = 120                                ## per channel
+    data*: array[DatChannel, seq[int32]]               ## empty: a deterministic chirp with noise
     text*: string = "9600 bps;$GPGGA,040506.00,1230.500000,N,04530.250000,E,1,8,0.9," &
-      "100.0,M,10.0,M,,*hh\r\n"          ## `*hh` becomes the NMEA checksum
+      "100.0,M,10.0,M,,*hh\r\n"                        ## `*hh` becomes the NMEA checksum
     fixLat*: Place = (12, 30_500_000, 'N')
     fixLon*: Place = (45, 30_250_000, 'E')
     line*, station*, shotId*, index*, counter*, sweepId*: int64
-    qcOffset*: int = 97                  ## 97, 99 or 100: the trailer's first-message variants
-    noQc*: bool                          ## no QC record in the trailer (made-up bytes instead)
+    qcOffset*: int = 97                                ## 97, 99 or 100: the trailer's first-message variants
+    noQc*: bool                                        ## no QC record in the trailer (made-up bytes instead)
     crew*: int = 3
-    vibrator*: int = 12                  ## the vibrator ID of the QC record
+    vibrator*: int = 12                                ## the vibrator ID of the QC record
     sweepNumber*: int = 2
     sweepChecksum*: int = 0x1234
     paramChecksum*: int = 0x5678
+    phaseByte*: int = 12                               ## QC byte 16
+    forceMax*: int = 61                                ## QC bytes 19 to 21, in percent
+    forceMin*: int = 58
+    forceAvg*: int = 59
+    thdMax*: int = 9                                   ## QC bytes 22 and 23
+    thdAvg*: int = 4
+    status*: array[4, byte] = [17'u8, 34, 51, 0b10101] ## QC bytes 28 to 31
+    corrMagnitude*: int = 777                          ## QC bytes 36-37
+    corr*: seq[int8]                                   ## the 128 values; empty: a made-up series, unless `noCorr`
+    noCorr*: bool                                      ## the series is not stored: every value 1, magnitude 0
+    heightCm*: int64 = 1_234_567                       ## QC bytes 185-188
+    qcSatellites*: int = 11
+    dops*: array[3, int] = [15, 9, 12]                 ## PDOP, HDOP, VDOP times 10
+    correctionAge*: int = 3
+    stiffness*: array[3, int] = [250, 100, 180]        ## maximum, minimum, average
+    viscosity*: array[3, int] = [90, 20, 55]
+    targetForce*: int = 4242                           ## QC bytes 209-210
     qcTrigger*: DatTime = DatTime(year: 2001, month: 2, day: 3, hour: 4, minute: 5,
       second: 7, nanosecond: 790_000_000)
-    staleTail*: bool = true              ## the last data record's padding is the previous block's tail
-    truncateAfter*: int = -1             ## >= 2: the file ends after that many blocks
-    zeroBlockAtCut*: bool = false        ## and one all-zero block follows
-    lastFrames*: int = -1                ## samples a multiple of 54: 54 (default) or 0 frames in 0x82
+    staleTail*: bool = true ## the last data record's padding is the previous block's tail
+    truncateAfter*: int = -1                           ## >= 2: the file ends after that many blocks
+    zeroBlockAtCut*: bool = false                      ## and one all-zero block follows
+    lastFrames*: int = -1 ## samples a multiple of 54: 54 (default) or 0 frames in 0x82
 
 const Block = 512
 
@@ -49,6 +66,10 @@ proc put32le(d: var seq[byte]; at: int; v: int64) =
 proc put32be(d: var seq[byte]; at: int; v: int64) =
   for i in 0 .. 3:
     d[at + 3 - i] = byte((v shr (8 * i)) and 0xFF)
+
+proc put16be(d: var seq[byte]; at: int; v: int) =
+  d[at] = byte((v shr 8) and 0xFF)
+  d[at + 1] = byte(v and 0xFF)
 
 proc put16le(d: var seq[byte]; at: int; v: int) =
   d[at] = byte(v and 0xFF)
@@ -226,6 +247,32 @@ proc synthDat*(s: SynthDat): seq[byte] =
     f[q + 8] = 0x33
     put32be(f, q + 9, s.sweepId)
     f[q + 13] = byte(s.sweepNumber)
+    f[q + 16] = byte(s.phaseByte)
+    f[q + 19] = byte(s.forceMax)
+    f[q + 20] = byte(s.forceMin)
+    f[q + 21] = byte(s.forceAvg)
+    f[q + 22] = byte(s.thdMax)
+    f[q + 23] = byte(s.thdAvg)
+    for i in 0 .. 3:
+      f[q + 28 + i] = s.status[i]
+    if s.noCorr:
+      put16be(f, q + 36, 0)
+      for i in 0 ..< 128:
+        f[q + 38 + i] = 1
+    else:
+      put16be(f, q + 36, s.corrMagnitude)
+      for i in 0 ..< 128:
+        f[q + 38 + i] = byte(if s.corr.len == 128: int(s.corr[i]) and 0xFF
+          else: (i * 7 + 3) mod 256)
+    put32be(f, q + 185, s.heightCm)
+    f[q + 189] = byte(s.qcSatellites)
+    for i in 0 .. 2:
+      f[q + 190 + i] = byte(s.dops[i])
+    f[q + 193] = byte(s.correctionAge)
+    for i in 0 .. 2:
+      f[q + 203 + i] = byte(s.stiffness[i])
+      f[q + 206 + i] = byte(s.viscosity[i])
+    put16be(f, q + 209, s.targetForce)
     f[q + 24] = byte(s.sweepChecksum shr 8)
     f[q + 25] = byte(s.sweepChecksum and 0xFF)
     f[q + 26] = byte(s.paramChecksum shr 8)
