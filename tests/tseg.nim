@@ -400,7 +400,12 @@ proc main*() =
     let stem = datFileStem(s)
     let p = s.writeSegyTo(folder)
     doAssert p == folder / (stem & ".sgy") and fileExists(p)
-    doAssert openSeismic(p).len == 4
+    block:
+      # closed here, not left to a destructor: on Windows a file that is still mapped
+      # cannot be replaced (the overwrite below)
+      var check = openSeismic(p)
+      doAssert check.len == 4
+      check.close()
     # never overwritten silently
     doAssertRaises(DatWriteError):
       discard s.writeSegyTo(folder)
@@ -529,7 +534,9 @@ proc main*() =
       joinThreads(threads)
       doAssert race.won.load == 1 and race.lost.load == 7 and race.other.load == 0,
         $(race.won.load, race.lost.load, race.other.load)
-      doAssert openSeismic(dir / "race" / (datFileStem(s) & ".sgy")).len == 4
+      var check = openSeismic(dir / "race" / (datFileStem(s) & ".sgy"))
+      doAssert check.len == 4
+      check.close()
 
   block writerRevisions:
     ## `writeSegyTraces` with its default suits a Rev 1 writer; the exact nanoseconds
@@ -581,7 +588,9 @@ proc main*() =
     long.incompleteWhy = "y".repeat(500)
     long.writeSegy(dir / "long2.sgy")
     doAssert textCards(long, DatWriteOptions()).len <= 37
-    doAssert "y".repeat(50) in openSeismic(dir / "long2.sgy").textHeader
+    var check = openSeismic(dir / "long2.sgy")
+    doAssert "y".repeat(50) in check.textHeader
+    check.close()
 
   block unwritable:
     doAssertRaises(CatchableError):

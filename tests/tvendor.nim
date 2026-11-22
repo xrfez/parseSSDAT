@@ -410,7 +410,9 @@ proc main*() =
     var cards = textCards(s, DatWriteOptions(vendorLayout: false))
     s.writeSegy(dir / "t.sgy", SegyOutputOptions(text: cards), DatWriteOptions(vendorLayout: false))
     # (no card 37 in a user's text header without the layout: no block is decoded)
-    doAssert openSeismic(dir / "t.sgy").blocksOf(reg).len == 0
+    var plainFile = openSeismic(dir / "t.sgy")
+    doAssert plainFile.blocksOf(reg).len == 0
+    plainFile.close()
 
   block blockLimits:
     ## A shot that does not fit the block is refused in words, never wrapped or
@@ -521,7 +523,9 @@ proc main*() =
     doAssert not fileExists(dir / "r0.sgy")
     s.writeSegy(dir / "r0.sgy", SegyOutputOptions(revision: SegyRevision(major: 0, minor: 0)),
       DatWriteOptions(vendorLayout: false))
-    doAssert openSeismic(dir / "r0.sgy").len == 4
+    var r0 = openSeismic(dir / "r0.sgy")
+    doAssert r0.len == 4
+    r0.close()
     # a stanza after the first trace: parseSEG's refusal comes out as DatWriteError
     var w = openSeismicWriter(dir / "late.sgy", SegyOutputOptions())
     w.writeSegyTraces(s)
