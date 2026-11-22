@@ -35,7 +35,7 @@ import parseSEG
 import ./[decode, types]
 
 const
-  PackageVersion = "0.1.0"
+  PackageVersion = "0.1.1"
   CodeGroundForce = 20'i16 ## SEG-Y trace code of the controller's ground force
   CardWidth = 76           ## parseSEG puts "C nn " before each textual header card of 80
   RecognitionCard = 37     ## the textual header card that names the shot stanzas
@@ -223,9 +223,6 @@ proc checkBlockFields(s: DatShot) =
     fail(s, "the firmware version does not fit the shot block")
   if s.qc.raw.len notin [0, QcRecordBytes]:
     fail(s, "the QC record has " & $s.qc.raw.len & " bytes, not " & $QcRecordBytes)
-  if s.gga.valid:
-    if s.gga.fixQuality notin 0 .. 255 or s.gga.satellites notin 0 .. 255:
-      fail(s, "the GGA fix quality or satellite count does not fit the shot block")
   if s.fix.heightDm notin -32768 .. 32767:
     fail(s, "the fix height " & $s.fix.heightDm & " does not fit the 16 bits of the shot block")
   if s.fix.fixQuality notin 0 .. 255 or s.fix.satellites notin 0 .. 255:
@@ -249,7 +246,8 @@ proc shotBlock*(s: DatShot; opts: DatWriteOptions): seq[byte] =
   ## positions that are written (`writtenPositions`) and `lbfPerCount`. The samples are not in it, and no sign is
   ## changed anywhere. Raises `DatWriteError`, in words, when a value does not fit its
   ## place in the block (a number above 32 bits or below 0, a date field above 255, a
-  ## record of the wrong length): nothing is wrapped or cut.
+  ## record of the wrong length): nothing is wrapped (the GGA fix quality and satellite count, which a
+  ## sentence can give above 255, are held at 255 as in 0.1.0).
   checkBlockFields(s)
   result = newSeq[byte](ShotBlockBytes)
   for i, c in ShotMagic:

@@ -567,6 +567,14 @@ proc main*() =
       discard shotBlock(sh, DatWriteOptions())
     except DatWriteError as e:
       doAssert "file number" in e.msg and "32 bits" in e.msg, e.msg
+    # a GGA sentence's quality and satellite count above 255 are held at 255, not refused
+    var gg = s
+    gg.gga.valid = true
+    gg.gga.fixQuality = 300
+    gg.gga.satellites = 300
+    let gb = shotBlock(gg, DatWriteOptions())
+    doAssert gb[112] == 255 and gb[113] == 255 and gb[114] == 1
+    gg.writeSegy(dir / "gga.sgy")
     # a shot that fits is written as before
     doAssert shotBlock(s, DatWriteOptions()).len == ShotBlockBytes
 

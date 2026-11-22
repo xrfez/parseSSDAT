@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.0"
+version       = "0.1.1"
 author        = "Joshua Fenner"
 description   = "Decode a vibrator controller's .dat signature files and write them as SEG-Y or SEG-D"
 license       = "MIT"

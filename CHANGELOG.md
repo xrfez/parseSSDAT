@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1 - 2026-11-22
+
+- Fixed: the vendor maps `parseSSDAT-segy-1` and `parseSSDAT-segd-1` (now map version 2)
+  force big-endian on every multi-byte field. The shot block is always written
+  big-endian, but parseSEG reads a stanza in the file's byte order, so a little-endian
+  SEG-Y written by 0.1.0 decoded through the old map gave wrong numbers (layout version
+  256, block length 8, a garbled file number and interval). SEG-D was not affected.
+  The bytes written are unchanged: every file of 0.1.0, big- or little-endian, decodes
+  correctly with the new maps. Copy both `.nif` files from `vendormaps/`. Map names and
+  card 37 are unchanged.
+- `shotBlock` called on its own checks what it is given and raises `DatWriteError` in
+  words (a number above 32 bits or negative, a date field, the fix's height, quality,
+  satellites or HDOP, a record of the wrong length) instead of writing a wrapped or cut
+  value. The writers already did this for the file number and the other 32-bit fields;
+  they now refuse the fix values too. A GGA fix quality or satellite count above 255 is
+  still held at 255, as in 0.1.0.
+- Needs parseSEG 0.19.1.
+
 ## 0.1.0 - 2026-11-22
 
 - Decoder for a vibrator controller's `.dat` signature files: `parseDat`, `readDat`,
